@@ -323,15 +323,15 @@ SCORING_TABLE: dict[tuple[UnitTypeId, UnitTypeId], float] = {
 # Rows whose bonus is support/positional utility (GS/FF, out-ranging static D),
 # NOT per-unit damage effectiveness that scales with enemy count.
 #
-# Why: production nudging sums these bonuses per observed enemy unit, which treats
-# a 5th Sentry as adding the same GS/FF value as the 2nd. Pro play treats Sentry
+# Why: the composition scorer sums these bonuses per believed enemy unit, which
+# treats a 5th Sentry as adding the same GS/FF value as the 2nd. Pro play treats Sentry
 # count as a FIXED investment driven by situation (LP: "critical mass of six sentries"
 # keeps a choke FF-blocked; learning-sc2: "minimum of eight Sentries against Zerg").
-# Base compositions already encode those ratios — nudging must not stack on top.
+# Base compositions already encode those ratios — the counter term must not stack on top.
 #
 # Consumers:
 #   - score_target (targeting): uses them — a Sentry still prefers shooting Marines
-#   - _compute_effectiveness (production nudging): MUST exclude them
+#   - counter_effectiveness (composition scoring): MUST exclude them
 SITUATIONAL_ROWS: set[tuple[UnitTypeId, UnitTypeId]] = {
     (UnitTypeId.SENTRY, UnitTypeId.MARINE),
     (UnitTypeId.SENTRY, UnitTypeId.ZERGLING),
