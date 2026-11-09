@@ -108,6 +108,7 @@ bot/
     group_snipe.py          # Group snipe behavior
   managers/
     macro.py                # Economy, production, build order execution
+    composition_scoring.py  # Scored composition competition: candidates + considerations
     reactions.py            # Threat detection, assess_threat(), cheese reactions
     scouting.py             # Scout management and intel gathering
     structure_manager.py    # Chrono, recharge, mass recall, building management

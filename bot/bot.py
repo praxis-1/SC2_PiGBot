@@ -38,6 +38,7 @@ from sc2.data import Race
 
 # Modular imports for separated concerns
 from bot.managers.macro import handle_macro, get_optimal_gas_workers, get_freeflow_mode
+from bot.managers.composition_scoring import CompositionScorer
 from bot.managers.structure_manager import use_chronoboost, use_recharge, use_mass_recall
 from bot.managers.reactions import ReactionManager, threat_detection
 from bot.combat import (
@@ -109,7 +110,6 @@ class PiG_Bot(AresBot):
         self._attack_initiation_count = 0  # Total times attack was initiated
         self._total_attack_time = 0.0     # Cumulative seconds spent in attack state
         self._current_attack_start = 0.0  # Timestamp current attack began (0 = not attacking)
-        self._economy_switch_triggered = False  # One-way transition from base to economy-gated composition
         self._rush_time_seconds = 0.0  # Rush time calculated in on_start
         self._under_attack = False
         self._is_building = False
@@ -147,10 +147,15 @@ class PiG_Bot(AresBot):
         self._last_enemy_army_visible_time = 0.0  # Last time we had direct vision of enemy army
         self._enemy_unit_last_seen: dict[int, float] = {}  # tag -> last time seen
         
-        # Production nudging cache (set by select_army_composition for debug overlay)
+        # Composition caches (set by select_army_composition for debug overlay)
         self._last_base_comp: dict = {}
-        self._last_nudged_comp: dict = {}
+        self._last_selected_comp: dict = {}
         self._resource_pressure: str = "BALANCED"  # GAS_STARVED, MINERAL_STARVED, or BALANCED
+
+        # Composition scorer — the macro manager's utility-AI decision layer.
+        # It owns the candidate ballot, the IntelContext and the incumbent that
+        # the commitment bonus protects; the macro manager asks it for a winner.
+        self.composition_scorer = CompositionScorer(self.config)
         
         # Intel urgency system (gradual build/decay to avoid oscillation)
         # 0.0 = no urgency, 1.0 = max urgency

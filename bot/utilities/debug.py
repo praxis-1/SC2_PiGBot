@@ -203,8 +203,8 @@ def render_combat_state_overlay(bot, main_army: Units, enemy_threat_level: int, 
     # Pass current y to sub-renderers so they continue from here
     bot._debug_y = _y
     
-    # Production nudging overlay: shows base vs nudged proportions
-    _render_production_nudge_overlay(bot)
+    # Composition overlay: shows the profile base vs the selected composition
+    _render_composition_overlay(bot)
     
     # Combat simulator results
     _render_combat_sim_overlay(bot, main_army)
@@ -213,7 +213,7 @@ def render_combat_state_overlay(bot, main_army: Units, enemy_threat_level: int, 
     render_target_markers(bot, main_army)
 
 
-# Short labels for unit types in production overlay
+# Short labels for unit types in the composition overlay
 _UNIT_SHORT_NAMES: dict[UnitTypeId, str] = {
     UnitTypeId.ZEALOT: "ZEA",
     UnitTypeId.STALKER: "STK",
@@ -226,37 +226,37 @@ _UNIT_SHORT_NAMES: dict[UnitTypeId, str] = {
 }
 
 
-def _render_production_nudge_overlay(bot) -> None:
-    """Render production nudging debug: base vs nudged proportions, resource pressure, priorities."""
+def _render_composition_overlay(bot) -> None:
+    """Render the composition overlay: profile base vs the scored selection."""
     base = getattr(bot, '_last_base_comp', {})
-    nudged = getattr(bot, '_last_nudged_comp', {})
+    selected = getattr(bot, '_last_selected_comp', {})
     if not base:
         return
-    
+
     _y = min(getattr(bot, '_debug_y', 0.30), 0.95)
     _step = 0.018
-    
+
     # Show proportions with deltas, sorted by final priority
     sorted_types = sorted(
-        nudged.keys() if nudged else base.keys(),
-        key=lambda ut: (nudged or base).get(ut, {}).get("priority", 99),
+        selected.keys() if selected else base.keys(),
+        key=lambda ut: (selected or base).get(ut, {}).get("priority", 99),
     )
     parts = []
     for unit_type in sorted_types:
         name = _UNIT_SHORT_NAMES.get(unit_type, unit_type.name[:3])
         base_pct = base.get(unit_type, {}).get("proportion", 0)
         base_pri = base.get(unit_type, {}).get("priority", "?")
-        nudged_info = nudged.get(unit_type, base.get(unit_type, {}))
-        nudged_pct = nudged_info.get("proportion", base_pct) if nudged else base_pct
-        nudged_pri = nudged_info.get("priority", base_pri)
-        delta = nudged_pct - base_pct
+        chosen_info = selected.get(unit_type, base.get(unit_type, {}))
+        chosen_pct = chosen_info.get("proportion", base_pct) if selected else base_pct
+        chosen_pri = chosen_info.get("priority", base_pri)
+        delta = chosen_pct - base_pct
         # Show priority change (e.g. [2->1]) or just current (e.g. [1])
-        pri_str = f"{base_pri}->{nudged_pri}" if nudged and nudged_pri != base_pri else f"{nudged_pri}"
+        pri_str = f"{base_pri}->{chosen_pri}" if selected and chosen_pri != base_pri else f"{chosen_pri}"
         if abs(delta) > 0.005:
             arrow = "+" if delta > 0 else ""
-            parts.append(f"{name}[{pri_str}] {base_pct:.0%}->{nudged_pct:.0%}({arrow}{delta:.0%})")
+            parts.append(f"{name}[{pri_str}] {base_pct:.0%}->{chosen_pct:.0%}({arrow}{delta:.0%})")
         else:
-            parts.append(f"{name}[{pri_str}] {nudged_pct:.0%}")
+            parts.append(f"{name}[{pri_str}] {chosen_pct:.0%}")
     
     # Resource pressure tag
     pressure = getattr(bot, '_resource_pressure', 'BALANCED')

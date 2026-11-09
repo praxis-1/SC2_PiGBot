@@ -64,6 +64,49 @@ UtilityAI:
             kind: linear
             minimum: 0.0
             maximum: 1.0
+        counter:                # counter effectiveness: the scoring table's own scale (-10..+12)
+            kind: linear
+            minimum: -8.0
+            maximum: 8.0
+        economy:               # affordability headroom: resources/min the economy can spend minus the mix's price
+            kind: logistic
+            minimum: -600.0
+            maximum: 600.0
+            midpoint: 0.0
+            steepness: 4.0
+        tech:                  # share of researched upgrades the mix exploits
+            kind: linear
+            minimum: 0.0
+            maximum: 1.0
+        cost:                  # resource + production-time burden of one unit of the mix
+            kind: linear
+            minimum: 0.0
+            maximum: 560.0
+        income:                # resources per minute of a full economy (1600 = "full")
+            kind: logistic
+            minimum: 0.0
+            maximum: 2000.0
+            midpoint: 800.0
+            steepness: 8.0
+        commitment:            # hysteresis: how much of the margin the incumbent keeps
+            kind: linear
+            minimum: 0.0
+            maximum: 1.0
+
+    # Macro composition scoring (bot/managers/composition_scoring.py).
+    # Weights are seeds — the counter term carries the scoring table's own
+    # magnitude (Liquipedia-annotated pairs, -10..+12); the economy and cost
+    # terms are guards that only separate the candidates while the economy is
+    # tight. Task 8 refits them from telemetry.
+    RescoreInterval: 10      # macro cycles between forced re-scores (a belief change re-scores earlier)
+    Composition:
+        CommitmentMargin: 0.03  # score margin a challenger must beat to take the crown
+        Weights:
+            counter: 2.0
+            economy: 1.0
+            tech: 0.5
+            cost: 0.6
+            commitment: 0.03
 
 Distances:
     GroundEnemyNearBases: 25.

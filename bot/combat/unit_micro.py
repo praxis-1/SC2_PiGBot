@@ -724,10 +724,10 @@ def merge_high_templars(bot) -> None:
     Archons. Only one pair per frame to avoid over-merging.
 
     Count threshold is per-matchup (lower in PvP where HTs are primarily
-    Archon-in-waiting). The Archon-percentage switch to army_1 handles
-    the loop brake, not the count gate.
+    Archon-in-waiting). The composition scorer picks the army mix; the count
+    gate is what keeps the merge loop from running away here.
 
-    Gas gate: If the active profile has archon_switch_gas_requirement > 0,
+    Gas gate: If the active profile has archon_merge_gas_requirement > 0,
     merging is blocked until enough gas geysers are built. This prevents
     premature Archon creation when the economy can't sustain HT production.
 
@@ -745,7 +745,7 @@ def merge_high_templars(bot) -> None:
     # to sustain HT production. Profiles with requirement=0 skip this check.
     from bot.constants import get_active_profile, _resolve
     profile = get_active_profile(bot)
-    gas_requirement = _resolve(profile.archon_switch_gas_requirement, bot)
+    gas_requirement = _resolve(profile.archon_merge_gas_requirement, bot)
     if gas_requirement > 0:
         gas_geysers = bot.structures(UnitTypeId.ASSIMILATOR).amount + bot.structures(UnitTypeId.ASSIMILATORRICH).amount
         if gas_geysers < gas_requirement:

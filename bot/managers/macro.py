@@ -26,14 +26,11 @@ from ares.consts import UnitRole, WORKER_TYPES, LOSS_DECISIVE_OR_WORSE
 from ares.consts import ID, TARGET
 
 from bot.utilities.performance_monitor import get_economy_state, get_resource_pressure
-from bot.intel import get_enemy_intel_quality
 from bot.managers.reactions import assess_threat
 from bot.utilities.debug import render_detection_cannon_debug
-from bot.combat.scoring_table import SCORING_TABLE, SITUATIONAL_ROWS
+from bot.utilities.telemetry import log_transition
 from bot.constants import (
     MEMORY_EXPIRY_TIME,
-    STALE_INTEL_THRESHOLD,
-    RESOURCE_PRESSURE_MAX_NUDGE,
     FREEFLOW_INCOME_RATIO_THRESHOLD,
     THREAT_BLOCK_EXPANSION_LEVEL,
     EXPANSION_INTEL_URGENCY_BLOCK,
@@ -220,8 +217,8 @@ PVT_STALKER_2021_ARMY_MODERATE = {
 
 # 2021 PvT Stalker-Centric post-Archon army: HTs have merged into Archons,
 # redistribute HT proportion to Stalker/Zealot. Keep small HT production for Storm.
-# Mirrors the 2023 profile's Archon switch pattern: stop heavy HT production,
-# let existing HTs merge, keep a small HT line for Storm/Feedback.
+# Stop heavy HT production, let existing HTs merge, keep a small HT line for
+# Storm/Feedback. The scorer picks this mix when it outscores the others.
 PVT_STALKER_2021_ARMY_FULL = {
     UnitTypeId.STALKER: {"proportion": 0.50, "priority": 0},
     UnitTypeId.ZEALOT: {"proportion": 0.35, "priority": 1},
@@ -234,8 +231,8 @@ PVT_STALKER_2021_ARMY_FULL = {
 PVT_STANDARD_2023_PROFILE.army_composition_0 = STANDARD_ARMY_0
 PVT_STANDARD_2023_PROFILE.army_composition_1 = STANDARD_ARMY_1
 PVT_STALKER_2021_PROFILE.army_composition_0 = PVT_STALKER_2021_ARMY
-PVT_STALKER_2021_PROFILE.army_composition_1 = PVT_STALKER_2021_ARMY_MODERATE  # Economy switch at moderate
-PVT_STALKER_2021_PROFILE.army_composition_2 = PVT_STALKER_2021_ARMY_FULL  # Archon switch at 15%
+PVT_STALKER_2021_PROFILE.army_composition_1 = PVT_STALKER_2021_ARMY_MODERATE  # Scored candidate
+PVT_STALKER_2021_PROFILE.army_composition_2 = PVT_STALKER_2021_ARMY_FULL  # Scored candidate
 PVZ_STANDARD_PROFILE.army_composition_0 = STANDARD_ARMY_0  # Same robo-centric comp as PvT
 PVZ_STANDARD_PROFILE.army_composition_1 = STANDARD_ARMY_1
 PVZ_SENTRY_PROFILE.army_composition_0 = PVZ_SENTRY_ARMY_0
@@ -274,32 +271,10 @@ PVP_2GATE_PROFILE.conditional_upgrades = [
 # 2021 profile: conditional upgrades are economy-gated (Weapons/Armor 2-3)
 
 # ===== PRODUCTION NUDGING =====
-# Uses SCORING_TABLE to shift army proportions toward unit types that are
-# effective against the observed enemy composition. See SCORING_TABLE docstring
-# in scoring_table.py for how to extend.
-#
-# HOW IT WORKS:
-#   1. Read cached enemy army (filtered: no workers, structures, expired ghosts)
-#   2. For each unit type in our composition, sum its SCORING_TABLE bonuses
-#      against all observed enemy units → "effectiveness score"
-#   3. Normalize effectiveness scores to a [-MAX_NUDGE, +MAX_NUDGE] range
-#   4. Add nudges to base proportions, clamp to MIN_PROPORTION, re-normalize to 1.0
-#
-# HOW TO EXTEND:
-#   - Adding a new unit to an army composition dict? Add SCORING_TABLE entries
-#     in scoring_table.py. The nudging picks them up automatically.
-#   - Adding a new army composition dict? Pass it through select_army_composition()
-#     and nudging applies to it like any other.
-
-PRODUCTION_MAX_NUDGE = 0.10
-"""Maximum proportion shift per unit type (±10%). Keeps changes conservative."""
-
-PRODUCTION_MIN_PROPORTION = 0.05
-"""Floor: never drop a unit type below 5% proportion (prevents starvation)."""
-
-PRODUCTION_MIN_ENEMY_UNITS = 3
-"""Don't nudge if fewer than this many enemy combat units seen (too little data)."""
-
+# The composition competition lives in bot/managers/composition_scoring.py: the
+# scoring table is the core base score there, not a post-decision nudge. The
+# only nudge left in this module is the production-mechanics priority reorder
+# (reorder_priorities_by_resources), which keeps the SpawnController alive.
 
 ANTI_COLOSSUS_TYPES = {
     UnitTypeId.VIKINGFIGHTER, UnitTypeId.VIKINGASSAULT, UnitTypeId.CORRUPTOR,
@@ -320,7 +295,7 @@ def _count_enemy_carriers(bot) -> int:
 
 def _get_enemy_combat_units(bot) -> list:
     """Get filtered enemy combat units for production analysis.
-    
+
     Excludes workers, structures, and expired ghost units (age >= MEMORY_EXPIRY_TIME).
     """
     cached = bot.mediator.get_cached_enemy_army or []
@@ -330,116 +305,6 @@ def _get_enemy_combat_units(bot) -> list:
         and not u.is_structure
         and u.age < MEMORY_EXPIRY_TIME
     ]
-
-
-def _compute_effectiveness(composition: dict, enemy_units: list) -> dict[UnitTypeId, float]:
-    """Score each own unit type's effectiveness against the enemy army.
-    
-    For each unit type in our composition, sums SCORING_TABLE bonuses against
-    every observed enemy unit. Returns average bonus per enemy unit. Rows in
-    SITUATIONAL_ROWS are excluded — their value is fixed-count support/utility
-    (e.g. GS/FF saturates after ~6 Sentries), not per-enemy damage that scales
-    with army size.
-    
-    Args:
-        composition: Army composition dict {UnitTypeId: {"proportion": ..., "priority": ...}}
-        enemy_units: Filtered enemy combat units
-        
-    Returns:
-        {UnitTypeId: avg_effectiveness_score} for each type in composition
-    """
-    n_enemies = len(enemy_units)
-    if n_enemies == 0:
-        return {}
-    
-    scores: dict[UnitTypeId, float] = {}
-    for own_type in composition:
-        total = sum(
-            SCORING_TABLE.get((own_type, e.type_id), 0.0)
-            for e in enemy_units
-            if (own_type, e.type_id) not in SITUATIONAL_ROWS
-        )
-        scores[own_type] = total / n_enemies
-    return scores
-
-
-def nudge_proportions(
-    base_composition: dict,
-    enemy_units: list,
-) -> dict:
-    """Apply scoring-table-driven proportion nudges to a base army composition.
-    
-    Returns a new composition dict with adjusted proportions. The base composition
-    is never mutated. If there's insufficient enemy data, returns base unchanged.
-    
-    Perf note: O(k * m) where k = unit types in comp (~5), m = enemy units.
-    Runs once per macro cycle — negligible frame cost.
-    
-    Args:
-        base_composition: The base army composition dict
-        enemy_units: Filtered enemy combat units
-        
-    Returns:
-        New composition dict with nudged proportions (sums to 1.0)
-    """
-    if len(enemy_units) < PRODUCTION_MIN_ENEMY_UNITS:
-        return base_composition
-    
-    effectiveness = _compute_effectiveness(base_composition, enemy_units)
-    if not effectiveness:
-        return base_composition
-    
-    # Find the range of effectiveness scores to normalize nudges
-    scores = list(effectiveness.values())
-    max_score = max(scores)
-    min_score = min(scores)
-    score_range = max_score - min_score
-    
-    # All scores equal (or only one type) → no nudge needed
-    if score_range < 0.1:
-        return base_composition
-    
-    # Normalize each score to [-1, +1] range, then scale by MAX_NUDGE
-    # Highest effectiveness → +MAX_NUDGE, lowest → -MAX_NUDGE
-    mid = (max_score + min_score) / 2.0
-    nudges: dict[UnitTypeId, float] = {}
-    for unit_type, score in effectiveness.items():
-        normalized = (score - mid) / (score_range / 2.0)  # -1 to +1
-        nudges[unit_type] = normalized * PRODUCTION_MAX_NUDGE
-    
-    # Reorder priorities by effectiveness: most effective → priority 0 (built first)
-    ranked_types = sorted(effectiveness, key=lambda t: effectiveness[t], reverse=True)
-    priority_map: dict[UnitTypeId, int] = {ut: i for i, ut in enumerate(ranked_types)}
-    
-    # Apply nudges to base proportions and reordered priorities
-    nudged: dict = {}
-    for unit_type, info in base_composition.items():
-        nudge = nudges.get(unit_type, 0.0)
-        base_prop = info["proportion"]
-        new_proportion = base_prop + nudge
-        # Only apply min floor if unit has base proportion > 0 or got a positive nudge
-        # Units at 0.0 base with no positive nudge should stay at 0.0
-        if base_prop > 0 or nudge > 0:
-            new_proportion = max(new_proportion, PRODUCTION_MIN_PROPORTION)
-        else:
-            new_proportion = 0.0
-        nudged[unit_type] = {
-            "proportion": new_proportion,
-            "priority": priority_map.get(unit_type, info["priority"]),
-        }
-    
-    # Re-normalize proportions to sum to exactly 1.0
-    # Round each to 4 decimal places, then fix the last to absorb rounding error
-    total = sum(v["proportion"] for v in nudged.values())
-    if total > 0:
-        items = list(nudged.values())
-        for info in items:
-            info["proportion"] = round(info["proportion"] / total, 4)
-        # Force exact 1.0 sum (ARES SpawnController asserts isclose to 1.0)
-        rounding_error = 1.0 - sum(v["proportion"] for v in items)
-        items[-1]["proportion"] = round(items[-1]["proportion"] + rounding_error, 4)
-    
-    return nudged
 
 
 def _get_gas_ratio(unit_type: UnitTypeId) -> float:
@@ -464,8 +329,8 @@ def reorder_priorities_by_resources(composition: dict, bot) -> dict:
 
     Only reorders units that can't currently be afforded — those are the ones
     that would cause the SpawnController's non-freeflow `break` to kill the
-    entire production loop. Affordable units keep their effectiveness-based
-    priority from the counter nudge (step 1), so the strategic choice of
+    entire production loop. Affordable units keep the effectiveness-based
+    priority the scorer gave them, so the strategic choice of
     "build the most effective unit first" is preserved.
 
     When balanced (no resource pressure): return composition unchanged.
@@ -496,7 +361,7 @@ def reorder_priorities_by_resources(composition: dict, bot) -> dict:
     # Split units into affordable (keep effectiveness priority) and
     # unaffordable (sort by gas ratio to push them to the back).
     # This prevents the SpawnController break while preserving the
-    # counter-nudge's effectiveness-based priority for units we can build.
+    # scorer's effectiveness-based priority for units we can build.
     affordable: list = []
     unaffordable: list = []
     for unit_type in composition:
@@ -516,7 +381,7 @@ def reorder_priorities_by_resources(composition: dict, bot) -> dict:
         reverse=gas_rich,
     )
 
-    # Affordable units keep their existing priority (from counter nudge).
+    # Affordable units keep their existing priority (from the scorer).
     # Unaffordable units get pushed behind all affordable ones.
     # Within each group, preserve relative order (stable sort).
     affordable.sort(key=lambda ut: composition[ut]["priority"])
@@ -531,226 +396,6 @@ def reorder_priorities_by_resources(composition: dict, bot) -> dict:
         }
 
     return reordered
-
-
-def resource_pressure_nudge(composition: dict, bot) -> dict:
-    """Layer 2: Shift proportions toward units whose cost matches available resources.
-    
-    When gas-starved (minerals >> gas): boost low-gas-ratio units, reduce high-gas ones.
-    When mineral-starved (gas >> minerals): boost high-gas-ratio units, reduce low-gas ones.
-    
-    Chained after scoring-table nudge_proportions() — both nudges compose additively.
-    Max shift ±RESOURCE_PRESSURE_MAX_NUDGE (15%), clamped to PRODUCTION_MIN_PROPORTION floor,
-    re-normalized to 1.0.
-    
-    Uses COST_DICT for dynamic gas-ratio lookup — no hardcoded costs.
-    
-    Perf note: O(k) where k = unit types in comp (~5). Negligible.
-    
-    Args:
-        composition: Army composition dict (already counter-nudged)
-        bot: Bot instance for resource access
-        
-    Returns:
-        New composition dict with resource-pressure-adjusted proportions
-    """
-    # Detect imbalance via shared economy signal (instantaneous bank —
-    # composition nudging should react to what we can afford right now)
-    pressure = get_resource_pressure(bot, sustained=False)
-    gas_starved = pressure == "GAS_STARVED"
-    mineral_starved = pressure == "MINERAL_STARVED"
-    
-    if not gas_starved and not mineral_starved:
-        return composition  # Balanced — no pressure nudge needed
-    
-    # Compute gas ratios for all unit types in composition
-    gas_ratios: dict[UnitTypeId, float] = {}
-    for unit_type in composition:
-        gas_ratios[unit_type] = _get_gas_ratio(unit_type)
-    
-    if not gas_ratios:
-        return composition
-    
-    # Normalize gas ratios to [-1, +1] range for nudge direction
-    ratios = list(gas_ratios.values())
-    max_r, min_r = max(ratios), min(ratios)
-    ratio_range = max_r - min_r
-    
-    if ratio_range < 0.05:
-        return composition  # All units cost roughly the same — no nudge
-    
-    mid_r = (max_r + min_r) / 2.0
-    
-    # Build nudge per unit type
-    nudged: dict = {}
-    for unit_type, info in composition.items():
-        gas_r = gas_ratios[unit_type]
-        normalized = (gas_r - mid_r) / (ratio_range / 2.0)  # -1 to +1
-        
-        if gas_starved:
-            # Boost low-gas units (negative normalized), penalize high-gas
-            nudge = -normalized * RESOURCE_PRESSURE_MAX_NUDGE
-        else:
-            # mineral_starved: Boost high-gas units, penalize low-gas
-            nudge = normalized * RESOURCE_PRESSURE_MAX_NUDGE
-        
-        new_proportion = info["proportion"] + nudge
-        new_proportion = max(new_proportion, PRODUCTION_MIN_PROPORTION)
-        nudged[unit_type] = {
-            "proportion": new_proportion,
-            "priority": info["priority"],
-        }
-    
-    # Re-normalize to 1.0
-    total = sum(v["proportion"] for v in nudged.values())
-    if total > 0:
-        items = list(nudged.values())
-        for info in items:
-            info["proportion"] = round(info["proportion"] / total, 4)
-        rounding_error = 1.0 - sum(v["proportion"] for v in items)
-        items[-1]["proportion"] = round(items[-1]["proportion"] + rounding_error, 4)
-    
-    return nudged
-
-
-def strategy_nudge_proportions(composition: dict, bot) -> dict:
-    """Layer 1.5: Shift proportions toward units effective against predicted enemy composition.
-
-    Uses strategy belief (P(cheese/all_in/timing/macro)) to predict what enemy units
-    we'll face, then scores our composition against those predicted units using the
-    existing SCORING_TABLE. This is data-driven — the only "opinion" is what units
-    each strategy/race typically produces (STRATEGY_EXPECTED_UNITS).
-
-    Chained after scoring-table nudge, before resource-pressure nudge.
-    Probability-weighted across categories above STRATEGY_NUDGE_THRESHOLD.
-    Max shift ±STRATEGY_NUDGE_MAX (10%), clamped to PRODUCTION_MIN_PROPORTION floor,
-    re-normalized to 1.0.
-
-    Perf note: O(k * m) where k = unit types in comp (~5), m = expected unit types (~5).
-    Runs once per macro cycle — negligible frame cost.
-
-    Args:
-        composition: Army composition dict (already counter-nudged)
-        bot: Bot instance for strategy belief access
-
-    Returns:
-        New composition dict with strategy-adjusted proportions
-    """
-    from bot.constants import (
-        STRATEGY_EXPECTED_UNITS,
-        STRATEGY_NUDGE_MAX,
-        STRATEGY_NUDGE_THRESHOLD,
-    )
-
-    # Guard: strategy belief must be enabled and have a prediction
-    if not bot.config.get("Belief", {}).get("enable_strategy", False):
-        return composition
-
-    prediction = getattr(
-        getattr(bot, "belief_state", None), "strategy", None
-    )
-    if prediction is None:
-        return composition
-    prediction = prediction.last_prediction
-    if prediction is None:
-        return composition
-
-    enemy_race = bot.enemy_race
-
-    # Accumulate probability-weighted effectiveness scores across categories
-    # Each category above threshold contributes proportionally to its P(category)
-    effectiveness: dict[UnitTypeId, float] = {}
-    total_weight = 0.0
-
-    for category, prob in prediction.probs.items():
-        if prob < STRATEGY_NUDGE_THRESHOLD:
-            continue
-        expected_units = STRATEGY_EXPECTED_UNITS.get((category, enemy_race))
-        if expected_units is None:
-            continue
-
-        # Convert expected unit proportions to a fake "enemy list" for
-        # _compute_effectiveness. Weight each unit type by its proportion.
-        # _compute_effectiveness sums SCORING_TABLE scores per enemy unit,
-        # so we create weighted "virtual" enemies.
-        fake_enemies = []
-        for unit_type, proportion in expected_units.items():
-            # Skip non-unit entries (Pylon, PhotonCannon, etc.) — not in SCORING_TABLE
-            if unit_type in (UnitTypeId.PYLON, UnitTypeId.PHOTONCANNON,
-                             UnitTypeId.BUNKER, UnitTypeId.SPINECRAWLER,
-                             UnitTypeId.SCV, UnitTypeId.DRONE, UnitTypeId.PROBE,
-                             UnitTypeId.MULE):
-                continue
-            # Create a minimal fake unit with type_id for _compute_effectiveness
-            # We need enough copies to represent the proportion weight
-            count = max(1, round(proportion * 10))  # Scale to integer counts
-            for _ in range(count):
-                fake_enemies.append(_FakeEnemy(unit_type))
-
-        if not fake_enemies:
-            continue
-
-        # Score our composition against these predicted enemies
-        cat_effectiveness = _compute_effectiveness(composition, fake_enemies)
-        if not cat_effectiveness:
-            continue
-
-        # Weight by P(category) and accumulate
-        for unit_type, score in cat_effectiveness.items():
-            effectiveness[unit_type] = effectiveness.get(unit_type, 0.0) + score * prob
-        total_weight += prob
-
-    if not effectiveness or total_weight < 0.01:
-        return composition
-
-    # Normalize effectiveness scores to [-1, +1] range, then scale by STRATEGY_NUDGE_MAX
-    scores = list(effectiveness.values())
-    max_score = max(scores)
-    min_score = min(scores)
-    score_range = max_score - min_score
-
-    if score_range < 0.1:
-        return composition  # All scores equal — no nudge needed
-
-    mid = (max_score + min_score) / 2.0
-    nudged: dict = {}
-    for unit_type, info in composition.items():
-        score = effectiveness.get(unit_type, mid)  # Default to mid if not scored
-        normalized = (score - mid) / (score_range / 2.0)  # -1 to +1
-        nudge = normalized * STRATEGY_NUDGE_MAX
-        new_proportion = info["proportion"] + nudge
-        # Only apply min floor if unit has base proportion > 0 or got a positive nudge
-        if info["proportion"] > 0 or nudge > 0:
-            new_proportion = max(new_proportion, PRODUCTION_MIN_PROPORTION)
-        else:
-            new_proportion = 0.0
-        nudged[unit_type] = {
-            "proportion": new_proportion,
-            "priority": info["priority"],
-        }
-
-    # Re-normalize to 1.0
-    total = sum(v["proportion"] for v in nudged.values())
-    if total > 0:
-        items = list(nudged.values())
-        for info in items:
-            info["proportion"] = round(info["proportion"] / total, 4)
-        rounding_error = 1.0 - sum(v["proportion"] for v in items)
-        items[-1]["proportion"] = round(items[-1]["proportion"] + rounding_error, 4)
-
-    return nudged
-
-
-class _FakeEnemy:
-    """Minimal stand-in for an enemy unit with just a type_id.
-
-    Used by strategy_nudge_proportions() to pass predicted enemy types
-    through _compute_effectiveness() without needing real Unit objects.
-    """
-    __slots__ = ("type_id",)
-
-    def __init__(self, type_id: UnitTypeId):
-        self.type_id = type_id
 
 
 # No static upgrade list - use get_desired_upgrades() instead
@@ -1184,101 +829,66 @@ def get_desired_forge_count(bot) -> int:
     return _resolve(profile.forge_count, bot)
 
 
-def select_army_composition(bot, main_army: Units) -> dict:
-    """
-    Determines which army composition to use based on the active BuildProfile
-    and observed enemy composition.
-    
+def select_army_composition(bot) -> dict:
+    """Pick the composition to build — the scorer's winner, priority-fixed.
+
+    The competition itself lives in bot/managers/composition_scoring.py: the
+    profile compositions, the hold option and the counter-driven variants are
+    scored against the believed enemy army on the macro cadence, and the winner
+    builds. This function adapts that winner to production and reports it.
+
     Steps:
-        1. Pick base composition from profile (army_composition_0)
-        2. Apply economy switch if threshold met (army_composition_0 → army_composition_1)
-        3. Apply archon switch if threshold met (→ army_composition_2, or army_1 fallback)
-        4. Apply scoring-table-driven proportion nudges based on enemy comp
-        5. Cache the nudged result on bot._last_nudged_comp for debug display
-    
+        1. Ask the scorer for the winning composition (cached between re-scores)
+        2. Priority reorder — production mechanics, not strategy
+        3. Emit the choice transition + cache it for the debug overlay
+
     Returns:
-        dict: The selected (and possibly nudged) army composition dictionary
+        dict: The selected army composition dictionary
     """
     profile = get_active_profile(bot)
-    
-    # All builds now have dedicated profiles — use profile compositions directly
-    selected_composition = profile.army_composition_0
-    army_1 = profile.army_composition_1
-    army_2 = profile.army_composition_2 if profile.army_composition_2 else army_1  # Fallback for profiles without army_2
-    threshold = profile.archon_switch_threshold
-    
-    # Economy switch: one-way transition from army_composition_0 to army_composition_1
-    # Once triggered, never reverts even if economy drops (sticky flag)
-    if profile.economy_switch_threshold is not None:
-        if not hasattr(bot, '_economy_switch_triggered'):
-            bot._economy_switch_triggered = False
-        
-        economy_state = get_economy_state(bot)
-        econ_threshold = profile.economy_switch_threshold
-        
-        if not bot._economy_switch_triggered:
-            if ((econ_threshold == "moderate" and economy_state in ("moderate", "full"))
-                    or (econ_threshold == "full" and economy_state == "full")):
-                bot._economy_switch_triggered = True
-        
-        if bot._economy_switch_triggered:
-            selected_composition = army_1
-    
-    # Switch composition when Archon percentage exceeds threshold
-    # Uses army_2 (post-Archon) if available, otherwise army_1 (legacy behavior)
-    if main_army and len(main_army) > 0:
-        archon_count = sum(1 for unit in main_army if unit.type_id == UnitTypeId.ARCHON)
-        archon_percentage = archon_count / len(main_army) if len(main_army) > 0 else 0
-        
-        if archon_percentage >= threshold:
-            selected_composition = army_2
-    
-    # === Nudge pipeline: scoring-table → strategy → resource-pressure → priority reorder ===
-    
-    # Step 1: Counter-table nudge (only if intel is fresh enough)
-    # When composition belief is enabled, use its probability-weighted freshness
-    use_belief = bot.config.get("Belief", {}).get("enable_composition", False)
-    if use_belief:
-        has_intel = bot._enemy_army_ever_seen
-        freshness = bot.belief_state.composition.freshness
-    else:
-        intel = get_enemy_intel_quality(bot)
-        has_intel = intel["has_intel"]
-        freshness = intel["freshness"]
+    selection = bot.composition_scorer.select(bot)
+    candidate = selection.candidate
+    # No candidate (empty ballot) — fall back to the profile's base build.
+    composition = candidate.composition if candidate else profile.army_composition_0
 
-    if has_intel and freshness > STALE_INTEL_THRESHOLD:
-        enemy_units = _get_enemy_combat_units(bot)
-        comp = nudge_proportions(selected_composition, enemy_units)
-    else:
-        comp = selected_composition
-    
-    # Step 1.5: Strategy nudge (shifts proportions toward units effective vs predicted enemies)
-    # Wrapped in try/except so a bug in strategy nudge can't break army production
-    try:
-        strategy_comp = strategy_nudge_proportions(comp, bot)
-        # Validate: proportions must sum to ~1.0 and all be non-negative
-        total = sum(v["proportion"] for v in strategy_comp.values())
-        if 0.9 < total < 1.1 and all(v["proportion"] >= 0 for v in strategy_comp.values()):
-            comp = strategy_comp
-    except Exception as e:
-        print(f"[StrategyNudge] Fallback to counter-nudged composition: {e}")
-    
-    # Step 2: Resource-pressure nudge (shifts proportions toward affordable units)
-    comp = resource_pressure_nudge(comp, bot)
-    
-    # Step 4: Priority reorder — push unaffordable units behind affordable ones
-    # Only touches units we can't afford right now; affordable units keep their
-    # effectiveness-based priority from step 1. Prevents SpawnController break
-    # in non-freeflow mode without overriding the strategic choice.
-    comp = reorder_priorities_by_resources(comp, bot)
-    
+    # Priority reorder — push unaffordable units behind affordable ones.
+    # Only touches units we can't afford right now; affordable units keep the
+    # effectiveness-based priority the scorer gave them. Prevents SpawnController
+    # break in non-freeflow mode without overriding the strategic choice.
+    composition = reorder_priorities_by_resources(composition, bot)
+
+    _report_composition_choice(bot, selection)
+
     # Cache for debug overlay
-    bot._last_base_comp = selected_composition
-    bot._last_nudged_comp = comp
-    # Resource pressure state for debug display (same signal as the nudge above)
+    bot._last_base_comp = profile.army_composition_0
+    bot._last_selected_comp = composition
+    # Resource pressure state for debug display
     bot._resource_pressure = get_resource_pressure(bot, sustained=False)
-    
-    return comp
+
+    return composition
+
+
+def _report_composition_choice(bot, selection) -> None:
+    """Emit the composition transition — the new telemetry gate for macro.
+
+    A transition event fires only when the winning candidate changes, so the
+    event marks decisions instead of the macro cycle. The winner's score and
+    the runner-up's ride along: the gap is what the commitment bonus is buying.
+    """
+    ranking = selection.ranking
+    winner = ranking[0] if ranking else None
+    runner_up = ranking[1] if len(ranking) > 1 else None
+    log_transition(
+        subsystem="macro",
+        action="composition_choice",
+        reason="scored_competition",
+        key="composition_choice",
+        value=winner.choice.name if winner else "none",
+        winner_score=round(winner.score, 4) if winner else 0.0,
+        runner_up_score=round(runner_up.score, 4) if runner_up else 0.0,
+        candidates=len(selection.candidates),
+        _ts=bot.time,
+    )
 
 
 def _train_observers(bot) -> None:
@@ -1674,7 +1284,7 @@ async def handle_macro(
     # Select army composition based on reaction state
     # ReactionManager handles the one-way transition from cheese → standard
     if not bot.reaction_manager.is_cheese_response:
-        army_composition = select_army_composition(bot, main_army)
+        army_composition = select_army_composition(bot)
         expansion_count = expansion_checker(bot, main_army)
     else:
         army_composition = CHEESE_DEFENSE_ARMY

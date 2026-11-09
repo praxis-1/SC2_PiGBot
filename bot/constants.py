@@ -642,13 +642,7 @@ Longer games / repelled attacks mean they had a transition plan — the server's
 commitment semantics call that macro pressure (agreement-validated: 41-45%
 exact / 62-68% aggression agreement vs 8-23% unconditioned, n=483)."""
 
-# ===== STRATEGY-AWARE COMPOSITION NUDGING =====
-STRATEGY_NUDGE_MAX = 0.10
-"""Maximum proportion shift from strategy nudge (same cap as PRODUCTION_MAX_NUDGE)."""
-
-STRATEGY_NUDGE_THRESHOLD = 0.4
-"""Only apply strategy nudge when P(category) exceeds this threshold."""
-
+# ===== STRATEGY-AWARE COMPOSITION SCORING =====
 STRATEGY_EXPECTED_UNITS: dict[tuple[StrategyCategory, Race], dict[UnitTypeId, float]] = {
     # Zerg cheese: 12-pool, proxy hatch spine — lings + drones + queen
     (StrategyCategory.CHEESE, Race.Zerg): {
@@ -757,10 +751,10 @@ STRATEGY_EXPECTED_UNITS: dict[tuple[StrategyCategory, Race], dict[UnitTypeId, fl
     },
 }
 """Expected enemy unit proportions per (strategy category, race).
-Used by strategy_nudge_proportions() to predict what we'll face and nudge
-our composition toward effective counters via SCORING_TABLE. Proportions
-are based on Liquipedia/community meta knowledge of typical compositions
-at the time each strategy hits."""
+The composition scorer (bot/managers/composition_scoring.py) blends these
+shares into the believed enemy army when the belief layer has no observation
+yet. Proportions are based on Liquipedia/community meta knowledge of typical
+compositions at the time each strategy hits."""
 
 # ===== STRATEGY-AWARE SCOUTING =====
 STRATEGY_HUNT_TARGETS: dict[StrategyCategory, list[str]] = {
@@ -1165,8 +1159,12 @@ FOCUS_MIN_STALKERS = 2
 """Minimum Stalkers required to commit a focus-fire. Below this, not worth the commitment."""
 
 # ===== RESOURCE-AWARE PRODUCTION =====
-RESOURCE_PRESSURE_MAX_NUDGE = 0.15
-"""Maximum proportion shift per unit type from resource pressure (±15%). Larger than scoring-table nudge since resource starvation is more urgent."""
+PRODUCTION_MIN_PROPORTION = 0.05
+"""Floor: never drop a unit type below 5% proportion (prevents starvation).
+
+The composition scorer clamps every candidate's proportions here — a unit type
+that is in the mix must keep a share, or production starves it.
+"""
 
 RESOURCE_IMBALANCE_RATIO = 2.0
 """Mineral:gas (or gas:mineral) ratio threshold to trigger resource-pressure nudging."""
@@ -1216,7 +1214,6 @@ class BuildProfile:
     """
     army_composition_0: dict[UnitTypeId, dict]
     army_composition_1: dict[UnitTypeId, dict]
-    archon_switch_threshold: float
     upgrade_order: list[UpgradeId]
     conditional_upgrades: list[tuple[UpgradeId, Callable]]
     gas_target: Union[int, Callable]
@@ -1227,16 +1224,13 @@ class BuildProfile:
     forge_count: Union[int, Callable]
     chrono_priority: list[UnitTypeId]
     conditional_structures: list[tuple[UnitTypeId, Callable]]
-    army_composition_2: dict[UnitTypeId, dict] = field(default_factory=dict)  # Post-Archon composition (used when archon % >= threshold)
-    economy_switch_threshold: Union[str, None] = None
-    """Economy state that triggers a one-way switch from army_composition_0 to
-army_composition_1. Valid values: 'moderate', 'full', or None (no switch).
-Once triggered, the switch never reverts even if economy drops."""
-    archon_switch_gas_requirement: Union[int, Callable] = 0
-    """Minimum gas geysers required for the Archon switch to trigger.
-Prevents the Archon composition switch until gas infrastructure can sustain
-HT production. Default 0 = no gas requirement (always allow switch).
-Set to 6 for gas-gated builds like the 2021 Stalker build."""
+    army_composition_2: dict[UnitTypeId, dict] = field(default_factory=dict)
+    """A third composition the scorer puts on the ballot. It is a plain candidate —
+    the old Archon-percentage trigger that used to select it is gone."""
+    archon_merge_gas_requirement: Union[int, Callable] = 0
+    """Gas geysers required before High Templars may merge into Archons.
+    Blocks premature Archon creation when the economy cannot sustain HT
+    production. Default 0 = no gas requirement."""
 
 
 # --- 2023 PvT Standard (Robo-Centric) ---
@@ -1244,7 +1238,6 @@ Set to 6 for gas-gated builds like the 2021 Stalker build."""
 PVT_STANDARD_2023_PROFILE = BuildProfile(
     army_composition_0={},  # Set at runtime from macro.py STANDARD_ARMY_0
     army_composition_1={},  # Set at runtime from macro.py STANDARD_ARMY_1
-    archon_switch_threshold=0.15,
     upgrade_order=[
         UpgradeId.WARPGATERESEARCH,
         UpgradeId.EXTENDEDTHERMALLANCE,
@@ -1381,13 +1374,13 @@ def _needs_warp_prism(bot) -> bool:
 
 # --- 2021 PvT Stalker-Centric ---
 # Twilight + Blink opener, Stalker/Zealot army, 2 gas, aggressive gateway scaling.
-# Economy-gated: switches to HT/Sentry composition at moderate economy.
+# army_0/1/2 are candidates on the scorer's ballot — the economy gate that used
+# to pick one of them is gone, the scorer weighs them against the believed enemy.
 # Upgrades gated by economy: Weapons/Armor 2 at moderate+, 3 at full.
 PVT_STALKER_2021_PROFILE = BuildProfile(
     army_composition_0={},  # Set at runtime from macro.py PVT_STALKER_2021_ARMY
     army_composition_1={},  # Set at runtime from macro.py PVT_STALKER_2021_ARMY_MODERATE
     army_composition_2={},  # Set at runtime from macro.py PVT_STALKER_2021_ARMY_FULL
-    archon_switch_threshold=0.15,  # Switch to post-Archon comp when Archons reach 15%
     upgrade_order=[
         UpgradeId.WARPGATERESEARCH,
         UpgradeId.BLINKTECH,
@@ -1419,8 +1412,7 @@ PVT_STALKER_2021_PROFILE = BuildProfile(
         UnitTypeId.NEXUS,
     ],
     conditional_structures=[(UnitTypeId.ROBOTICSFACILITY, _needs_robo_for_detection)],  # Reactive Robo for detection
-    economy_switch_threshold="moderate",  # One-way switch to HT/Sentry composition at moderate economy
-    archon_switch_gas_requirement=6,  # Need 6 gas geysers before Archon switch (sustains HT production)
+    archon_merge_gas_requirement=6,  # No HT→Archon merges until gas can sustain HT production
 )
 
 # Lookup dict: build name (from protoss_builds.yml) → BuildProfile
@@ -1435,7 +1427,6 @@ BUILD_PROFILES: dict[str, BuildProfile] = {
 PVZ_STANDARD_PROFILE = BuildProfile(
     army_composition_0={},  # Set at runtime from macro.py STANDARD_ARMY_0
     army_composition_1={},  # Set at runtime from macro.py STANDARD_ARMY_1
-    archon_switch_threshold=0.15,
     upgrade_order=[
         UpgradeId.WARPGATERESEARCH,
         UpgradeId.EXTENDEDTHERMALLANCE,
@@ -1470,11 +1461,11 @@ PVZ_STANDARD_PROFILE = BuildProfile(
 # Stalker/Immortal/Sentry all-in. Warp Prism + Immortal push with FF support.
 # No HT/Templar Archive — gas goes to Immortal/Sentry.
 # army_0 = all-in push, army_1 = recovery (Disruptor/Colossus via RoboBay).
-# Economy switch to army_1 fires if the push stalls and economy matures.
+# Both are candidates on the scorer's ballot — the old economy switch that
+# picked one is gone.
 PVZ_SENTRY_PROFILE = BuildProfile(
     army_composition_0={},  # Set at runtime from macro.py PVZ_SENTRY_ARMY_0
     army_composition_1={},  # Set at runtime from macro.py PVZ_SENTRY_ARMY_1
-    archon_switch_threshold=0.15,
     upgrade_order=[
         UpgradeId.WARPGATERESEARCH,
         UpgradeId.CHARGE,
@@ -1500,7 +1491,6 @@ PVZ_SENTRY_PROFILE = BuildProfile(
         UnitTypeId.NEXUS,
     ],
     conditional_structures=[],  # Shield Battery is in the build order, not conditional
-    economy_switch_threshold="moderate",  # Switch to recovery comp if push stalls
 )
 
 # --- PvP 2-Gate Expand ---
@@ -1508,7 +1498,6 @@ PVZ_SENTRY_PROFILE = BuildProfile(
 PVP_2GATE_PROFILE = BuildProfile(
     army_composition_0={},  # Set at runtime from macro.py PVP_ARMY_0
     army_composition_1={},  # Set at runtime from macro.py PVP_ARMY_1
-    archon_switch_threshold=0.30,
     upgrade_order=[
         UpgradeId.WARPGATERESEARCH,
         UpgradeId.BLINKTECH,
