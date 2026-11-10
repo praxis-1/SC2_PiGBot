@@ -22,6 +22,8 @@ Lay the utility-AI foundation for the whole bot — one shared reasoner over one
 
 Every decision cycle, all candidate actions get a number; the highest wins. No if-then gates, no sticky switches.
 
+**Design authority beyond this plan:** the owner's vault architecture notes are upstream of this plan and take precedence where they speak. The counter-table lineage in particular comes from `400 Notes & Ideas/Counter Tables, Demand Systems, and Reinforcement Learning — Architecture Session.md` (MindMe PostBots session 2026-08-29, Addendum 2026-09-12). Rule for every task brief: sweep the owner's 400 Notes architecture docs for the task's domain BEFORE writing the brief.
+
 - **Reasoner** = a manager's decision step. **Choices** = its candidates (compositions, responses, scout missions).
 - **Consideration** = one scored aspect of the situation (economy, threat, cost, staleness). Small, parameterized, reusable across managers. Two functions: `load(params)` and `evaluate(context) → appraisal`.
 - **Context** = the intel snapshot handed to considerations. Perception belongs to the intel layer; considerations never dig into raw game state.
@@ -120,8 +122,10 @@ score(comp) = [ Σ counter_effectiveness(my_units vs believed_enemy_comp)
 - Candidates: current profile compositions + counter-driven variants + hold/defend candidate, capped at 8 per cycle. The winner builds.
 - Remove sticky one-way switches and the threshold archon switch. Stabilizers: curve steepness first, commitment consideration second — never hard switches.
 - Magnitudes: seed from Liquipedia baselines, fit later from telemetry (Task 8); document seed provenance in comments.
+- **Buildability invariant (MindMe, added 2026-11-10 after the gate fail):** every candidate on the ballot must be fully buildable with current tech and production — MindMe's rule: the counter walk "stops at the first row where it can build everything. Always lands on something." Ideal counters that are not yet buildable are translated toward the nearest reachable approximation along the ARES tech tree (extraction/query job — ARES already holds prerequisites, costs, build times; no hand-authored tech map), never silently dropped alone.
 
 **Acceptance:**
+- [ ] **buildability contract test (added 2026-11-10):** every candidate on the ballot is fully buildable, and the ballot is never empty — a permanent regression pin after the 2026-11-09 gate failure, where 74% of the winning candidate's counter score came from unbuildable units (COLOSSUS/HT/DISRUPTOR with no Robotics tech)
 - [x] unit tests pin curve shapes and candidate scoring before integration (unit) *(2026-11-09: `tests/unit/test_composition_scoring.py` — 33 checks written before the module landed; `poetry run pytest` → 82 passed (49 pre-existing + 33 new). Pinned: the counter sums read straight out of SCORING_TABLE (share-weighted, situational rows excluded), the signed cost base, belief confidence as a multiplier and never a term, the canonical `score = (Σ bases) × confidence`, the candidate cap, the hold candidate's survival, the deterministic tie order, the counter variant's shift, the tech-ready filter, ARES composition validity (Σ = 1.0, priority ∈ [0,11)), and the commitment hysteresis (inside the margin, past the margin, bonus fade))*
 - [x] econ switch removed, no one-way state remains (offline) *(2026-11-09: `grep -rn "_economy_switch_triggered\|economy_switch_threshold\|archon_switch_threshold" bot/ tests/ config.yml` → 0 hits outside the removal-proof test itself; `bot._economy_switch_triggered` deleted from bot.py; `economy_switch_threshold`, `archon_switch_threshold` retired from `BuildProfile`; the archon gas gate survives under its own name (`archon_merge_gas_requirement`) because it gates HT merging, not a switch. The old one-way economy switch is replaced by a scored commitment bonus — the composition now switches back when the challenger's advantage grows, which the sticky flag could never do)*
 - [ ] branch passes full roster regression vs master within the noise band, compared in the lab's Compare tab (lab) *(2026-11-09: NOT run — lab-channel gate, no runner access in the task environment. Owner to run master vs feature/task-4-macro-scoring before merge, ±1 game per 3-game series)*
@@ -181,6 +185,16 @@ u(scout) = info_gain(staleness × decision_impact) × P_survive − cost(worker-
 - [ ] the four hard-coded `_intel_urgency > 0.5` gates (scout hunt, hallucination scout, expansion block, urgent observer) route through one shared staleness consideration — the urgent-observer gate lives in structure_manager and may follow in Phase 2 (unit)
 - [ ] staleness gate tested (decay curve, not binary cutoff) (unit)
 - [ ] full regression vs master within the noise band (lab)
+
+## Task 9 — Tech-proximity semi-tree (future phase, from the vault Addendum 2026-09-12)
+
+**Goal:** the full "ideal vs what can I actually do now" machinery — the vault architecture doc §B/§C/§D, sequenced after the manual conversions (its own §E sequencing: response fixes first, vocabulary expansion second, graph/learned layers last).
+
+- Compositions as nodes, viable next compositions as edges weighted by switching cost = forward spend + vulnerability window (sunk cost excluded) — extracted from ARES/game data, no hand-authored tech map.
+- Counter selection = counter-value ÷ switching-cost, walked from the current army node. Trunk builds (stalker-robo, sky, splash) pay no switching tax; fringe counters only followed when value justifies cost.
+- Three-layer scope split: fight oracle (what trades best) / tech graph (numbers only, no decisions) / policy module (reinforce vs invest, gated by belief confidence).
+
+**Acceptance:** defined when scheduled. Depends on Tasks 4–7 outcomes.
 
 ## Task 8 — Fitted magnitudes from telemetry
 
