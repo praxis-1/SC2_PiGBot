@@ -151,6 +151,7 @@ SCORING_TABLE: dict[tuple[UnitTypeId, UnitTypeId], float] = {
     (UnitTypeId.STALKER, UnitTypeId.HIGHTEMPLAR):     6.0,  # LP: "an almost harmless attack and is relatively weak in terms of hit points and shields"
     (UnitTypeId.STALKER, UnitTypeId.ARCHON):          6.0,  # LP: "the way to counter Archons is by simply focus firing them"
     (UnitTypeId.STALKER, UnitTypeId.SENTRY):          6.0,  # LP: Guardian Shield makes the Sentry "a high priority target for opposing armies"
+    (UnitTypeId.STALKER, UnitTypeId.DISRUPTOR):       6.0,  # LP: "Stalkers can use Blink to avoid damage from the Nova" — the Disruptor has no auto attack
     (UnitTypeId.STALKER, UnitTypeId.LURKERMPBURROWED): -6.0,  # LP: "Lurkers rip the standard complementary gateway unit to Colossi, the Stalker"
 
     # Immortals: anti-armor specialist (LP: "50 base damage against armored")
@@ -257,6 +258,7 @@ SCORING_TABLE: dict[tuple[UnitTypeId, UnitTypeId], float] = {
     (UnitTypeId.HIGHTEMPLAR, UnitTypeId.SENTRY):     6.0,  # LP: the Sentry is susceptible to Feedback
     # PvP mirror target (enemy Protoss units we can face)
     (UnitTypeId.HIGHTEMPLAR, UnitTypeId.COLOSSUS):  -6.0,  # LP (in-game help): High Templar is weak vs Colossus
+    (UnitTypeId.HIGHTEMPLAR, UnitTypeId.ARCHON):    -6.0,  # LP: "Archons are strong against almost every Protoss unit"
 
     # Adepts: strong vs light, no anti-air (LP: "strong against early Zealots and other light units")
     (UnitTypeId.ADEPT, UnitTypeId.MARINE):    6.0,  # Light, early numbers

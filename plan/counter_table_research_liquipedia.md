@@ -94,6 +94,7 @@ existing (COLOSSUS, VIKINGFIGHTER) -10.0 — "Vikings...primary counter to Colos
     the latter's bonus vs shields and the former's inability to reliably dodge purification novas"
   - Pairs: (IMMORTAL, DISRUPTOR) +8.0 [Immortals handle Disruptor numbers; 3 Novas to kill one];
     (STALKER, DISRUPTOR) +6.0 [Blink dodges the Nova, the Disruptor has no auto attack];
+    (PHOENIX, DISRUPTOR) +8.0 [Phoenix disable the Disruptor once the Nova is launched];
     (ARCHON, DISRUPTOR) -8.0 [Disruptors counter Archons];
     (ZEALOT, DISRUPTOR) -8.0 [Nova one-shots Zealots]
   - Mirror (our Disruptor vs their Archon): (DISRUPTOR, ARCHON) -8.0 [4 Novas to take out an Archon]
@@ -176,6 +177,8 @@ existing (COLOSSUS, VIKINGFIGHTER) -10.0 — "Vikings...primary counter to Colos
   - Attacker side: (COLOSSUS, MARAUDER) -8.0 [very weak against mass Marauders];
     (COLOSSUS, SIEGETANKSIEGED) -4.0 [the only ground unit that out-ranges it];
     (COLOSSUS, IMMORTAL) -6.0; (COLOSSUS, HIGHTEMPLAR) +8.0 [in-game help: HT weak vs Colossus]
+  - Same quote, Stalker side: (STALKER, LURKERMPBURROWED) -6.0 [the Lurker strips the Stalker, the
+    Colossus comp's anti-armor/anti-air unit]
 
 ## PHOENIX (Stargate, Air, Light, Mechanical)
 - LP: "great hit-and-run"; "effective at disabling caster units or destroying them outright. Most casters have light armor"; lifts high-threat units (Siege Tanks) — Graviton Beam per LP infobox
