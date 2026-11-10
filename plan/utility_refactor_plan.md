@@ -24,6 +24,8 @@ Every decision cycle, all candidate actions get a number; the highest wins. No i
 
 **Design authority beyond this plan:** the owner's vault architecture notes are upstream of this plan and take precedence where they speak. The counter-table lineage in particular comes from `400 Notes & Ideas/Counter Tables, Demand Systems, and Reinforcement Learning — Architecture Session.md` (MindMe PostBots session 2026-08-29, Addendum 2026-09-12). Rule for every task brief: sweep the owner's 400 Notes architecture docs for the task's domain BEFORE writing the brief.
 
+**Fallback rule (owner directive 2026-11-10):** a fallback/last-resort path is permitted only as a last line of defense for a structural invariant (e.g., "the ballot is never empty"), and it must satisfy ALL of: (1) it never decides — candidates it produces still compete on score, no fiat wins; (2) it is OBSERVABLE — engaging it emits a telemetry event, so the primary path's failure is an alarm, not silent work the team relies on without knowing; (3) it is on the ledger — every fallback carries a comment and a plan entry naming the mechanism that will retire it (see Task 8 audit, Task 9 retirement). "If I didn't consider something this should catch it" is not a design; a fallback that is doing real work means the design above it is wrong. No duct tape as a deliverable.
+
 - **Reasoner** = a manager's decision step. **Choices** = its candidates (compositions, responses, scout missions).
 - **Consideration** = one scored aspect of the situation (economy, threat, cost, staleness). Small, parameterized, reusable across managers. Two functions: `load(params)` and `evaluate(context) → appraisal`.
 - **Context** = the intel snapshot handed to considerations. Perception belongs to the intel layer; considerations never dig into raw game state.
@@ -193,6 +195,7 @@ u(scout) = info_gain(staleness × decision_impact) × P_survive − cost(worker-
 - Compositions as nodes, viable next compositions as edges weighted by switching cost = forward spend + vulnerability window (sunk cost excluded) — extracted from ARES/game data, no hand-authored tech map.
 - Counter selection = counter-value ÷ switching-cost, walked from the current army node. Trunk builds (stalker-robo, sky, splash) pay no switching tax; fringe counters only followed when value justifies cost.
 - Three-layer scope split: fight oracle (what trades best) / tech graph (numbers only, no decisions) / policy module (reinforce vs invest, gated by belief confidence).
+- **Retire the hand-tuned conservative fallback (owner directive 2026-11-10):** "cheapest buildable = safest" in `_conservative_buildable` is a seed judgment standing in for a real measure. Task 9 replaces it with the earned version: nearest-reachable selection by switching cost from the incumbent node (forward spend + vulnerability window), computed from the tech graph — not a heuristic, and no longer a fallback at all but the primary translation path. Until Task 9 lands, the fallback must remain an OBSERVABLE alarm (see the Design language fallback rule), never a silent workhorse.
 
 **Acceptance:** defined when scheduled. Depends on Tasks 4–7 outcomes.
 
@@ -201,6 +204,7 @@ u(scout) = info_gain(staleness × decision_impact) × P_survive − cost(worker-
 **Goal:** reseed score weights using lab outcomes instead of Liquipedia seeds alone.
 
 **Method:** fit per-term weights against the 2,300+ game corpus (e.g., immortal-vs-roach outcomes vs win rate).
+- [ ] **fallback-engagement telemetry audit (owner directive 2026-11-10):** before fitting, measure how often the conservative fallback fired in the corpus and in gate series. Frequent engagement means the primary candidate-construction path is misaligned with reachable tech (profile bases containing unbuildable mixes) — fix the construction, not the weights. If the fallback fired at all in a gate series, the PR must say so.
 **Acceptance:**
 - [ ] fitted weights documented with fit evidence (offline)
 - [ ] regression run shows no-worse within the noise band across the roster; improvements logged per matchup; series length stated in the PR (lab)
