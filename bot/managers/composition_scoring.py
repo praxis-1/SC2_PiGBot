@@ -10,20 +10,27 @@ Key Decisions: The scoring table is the core base score, not a post-decision
                first and a scored commitment (hysteresis) bonus second.
                The cost term is the price of a mix; the economy term is the
                guard that says whether we can sustain it.
+               Buildability invariant: every candidate on the ballot is fully
+               buildable and the ballot is never empty — a composition
+               production cannot execute never wins the competition.
 Limitations: The magnitudes are seeds — Task 8 refits them from telemetry. The
                scorer re-scores on the macro cadence (a belief change or every N
-               cycles), never per frame.
+               cycles), never per frame. The nearest-reachable translation runs
+               in the counter-variant machinery only; the tech-proximity
+               semi-tree (Task 9) is where the wider translation belongs.
 """
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from sc2.constants import EQUIVALENTS_FOR_TECH_PROGRESS
 from sc2.ids.unit_typeid import UnitTypeId
 
 from ares.consts import ALL_STRUCTURES, WORKER_TYPES
 from ares.dicts.cost_dict import COST_DICT
 from ares.dicts.unit_data import UNIT_DATA
+from ares.dicts.unit_tech_requirement import UNIT_TECH_REQUIREMENT
 
 from bot.combat.scoring_table import SCORING_TABLE, SITUATIONAL_ROWS
 from bot.constants import (
@@ -71,6 +78,54 @@ COUNTER_SOURCE = "counter"
 
 HOLD_NAME = "hold"
 """Name of the hold candidate."""
+
+# ===== BUILDABILITY =====
+
+FALLBACK_SOURCE = "fallback"
+"""Candidate is the conservative mix that keeps the ballot alive."""
+
+FALLBACK_NAME = "fallback"
+"""Name of the conservative buildable candidate."""
+
+
+def _build_tech_equivalents() -> dict[UnitTypeId, UnitTypeId]:
+    """The base building each equivalent structure stands in for.
+
+    A Warp Gate is a Gateway, a Phasing Warp Prism is a Warp Prism — the tech
+    tree counts them as one node. The first base (alphabetically) wins, so the
+    mapping is deterministic.
+    """
+    mapping: dict[UnitTypeId, UnitTypeId] = {}
+    for base in sorted(EQUIVALENTS_FOR_TECH_PROGRESS, key=lambda item: item.name):
+        equivalents = sorted(
+            EQUIVALENTS_FOR_TECH_PROGRESS[base], key=lambda item: item.name
+        )
+        for equivalent in equivalents:
+            mapping.setdefault(equivalent, base)
+    return mapping
+
+
+TECH_EQUIVALENTS = _build_tech_equivalents()
+"""Equivalent structures folded onto their base building."""
+
+
+def _tech_requirements(unit_type: UnitTypeId) -> frozenset[UnitTypeId]:
+    """The buildings a unit type needs before it can be trained.
+
+    ARES' own table — the one ``tech_ready_for_unit`` walks — with the
+    equivalent structures folded onto their base, so two unit types on the same
+    tech path compare equal.
+    """
+    return frozenset(
+        TECH_EQUIVALENTS.get(building, building)
+        for building in UNIT_TECH_REQUIREMENT.get(unit_type, ())
+    )
+
+
+def _tech_distance(ideal: UnitTypeId, other: UnitTypeId) -> int:
+    """How far apart two unit types sit on the tech tree, in buildings."""
+    return len(_tech_requirements(ideal) ^ _tech_requirements(other))
+
 
 # ===== COST MODEL =====
 
@@ -502,6 +557,13 @@ def build_candidates(
     builds first, then hold, then the variants by counter value — so a tie
     keeps the profile's default build.
 
+    Every candidate on the ballot is buildable. Each composition is filtered
+    through the tech we actually have and re-normalized, so a composition
+    production cannot execute never reaches the scoring — the 2026-11-09 gate
+    failure crowned a robo-centric mix with no Robotics tech and production
+    starved on it. The ballot is never empty: the conservative fallback stands
+    in when nothing else survives.
+
     `hold_composition` is the composition we already decided to build (the last
     round's winner). It is the defensive option: it needs no new tech and no
     composition switch. It is deliberately *not* the army's current mix — that
@@ -524,6 +586,9 @@ def build_candidates(
         for unit_type in known_types
         if tech_ready is None or tech_ready(unit_type)
     }
+    translation = _translation_map(
+        known_types, _profile_vocabulary(profile_compositions), buildable, values
+    )
 
     def _add(name: str, composition: dict, source: str) -> None:
         if not composition:
@@ -541,10 +606,10 @@ def build_candidates(
         )
 
     for name, composition in profile_compositions:
-        _add(name, composition, PROFILE_SOURCE)
+        _add(name, _buildable_composition(composition, buildable), PROFILE_SOURCE)
 
     if hold_composition:
-        hold = _hold_composition(hold_composition, base)
+        hold = _hold_composition(hold_composition, base, buildable)
         if hold:
             # The hold candidate is never deduplicated: it means "keep building
             # what we decided to build", and the cap must not squeeze the
@@ -557,8 +622,17 @@ def build_candidates(
                 )
             )
 
-    for unit_type, variant in _counter_variants(base, values, buildable, max_variants):
+    for unit_type, variant in _counter_variants(
+        _buildable_composition(base, buildable),
+        values,
+        buildable,
+        translation,
+        max_variants,
+    ):
         _add(f"counter_{unit_type.name}", variant, COUNTER_SOURCE)
+
+    if not candidates:
+        _add(FALLBACK_NAME, _fallback_composition(base, buildable), FALLBACK_SOURCE)
 
     return candidates[:cap]
 
@@ -572,49 +646,205 @@ def _unit_counter_value(
     )
 
 
-def _hold_composition(
-    hold: Mapping[UnitTypeId, dict], base: Mapping[UnitTypeId, dict]
-) -> dict:
-    """The composition we already build, restricted to the build's unit types.
+def _profile_vocabulary(
+    profile_compositions: Sequence[tuple[str, dict]],
+) -> set[UnitTypeId]:
+    """The unit types the build actually fields — a share at or above the floor.
 
-    Continuity is the point: the hold candidate needs no new tech and no
-    composition switch, and the priorities stay the profile's build order.
+    Only these may stand in for a unit we cannot build: substituting a unit
+    type the build does not field would be a strategy change, not a
+    translation.
     """
-    composition: dict[UnitTypeId, dict] = {}
-    for unit_type, info in hold.items():
-        if unit_type not in base:
+    vocabulary: set[UnitTypeId] = set()
+    for _, composition in profile_compositions:
+        for unit_type, info in composition.items():
+            if float(info["proportion"]) >= PRODUCTION_MIN_PROPORTION:
+                vocabulary.add(unit_type)
+    return vocabulary
+
+
+def _translation_map(
+    unit_types: Iterable[UnitTypeId],
+    vocabulary: Iterable[UnitTypeId],
+    buildable: set[UnitTypeId],
+    values: Mapping[UnitTypeId, float],
+) -> dict[UnitTypeId, UnitTypeId]:
+    """The nearest buildable stand-in for every unit type we cannot build yet.
+
+    The counter table's ideal is often ahead of our tech (a Colossus before
+    the Robotics Bay). ARES holds the prerequisites, so "nearest" is a
+    question the tech tree answers: the buildable unit type whose buildings
+    differ least from the ideal's. The stand-in inherits the ideal's place in
+    the ranking, so the mix moves toward the counter line as far as we can
+    reach instead of the ideal being dropped on the floor.
+
+    Ties break on the counter value (the better counter stands in), then on
+    price (the cheaper stand-in is the more conservative one) and finally on
+    the unit name, so the map is deterministic.
+    """
+    stand_ins = sorted(set(vocabulary) & buildable, key=lambda item: item.name)
+    translation: dict[UnitTypeId, UnitTypeId] = {}
+    for unit_type in unit_types:
+        if unit_type in buildable:
             continue
-        composition[unit_type] = {
+        candidates = [other for other in stand_ins if other != unit_type]
+        if not candidates:
+            continue
+        translation[unit_type] = min(
+            candidates,
+            key=lambda other: (
+                _tech_distance(unit_type, other),
+                -values.get(other, 0.0),
+                _unit_price(other),
+                other.name,
+            ),
+        )
+    return translation
+
+
+def _unit_price(unit_type: UnitTypeId) -> float:
+    """What one unit costs in resources — ARES' cost table."""
+    cost = COST_DICT.get(unit_type)
+    if cost is None:
+        return 0.0
+    return float(cost.minerals + cost.vespene)
+
+
+def _buildable_composition(
+    composition: Mapping[UnitTypeId, dict], buildable: set[UnitTypeId]
+) -> dict:
+    """The part of a composition production can actually execute.
+
+    A unit type we have no tech for is dropped, and a unit type below the
+    production floor is dropped (it is not worth a production slot). The rest
+    is re-normalized: ARES asserts the proportions sum to 1.0, so a filtered
+    composition has to be re-balanced before it goes on the ballot.
+    """
+    filtered = {
+        unit_type: {
             "proportion": float(info["proportion"]),
             "priority": int(info["priority"]),
         }
-    if not composition:
+        for unit_type, info in composition.items()
+        if unit_type in buildable
+        and float(info["proportion"]) >= PRODUCTION_MIN_PROPORTION
+    }
+    if not filtered:
         return {}
-    return _normalize_composition(composition)
+    return _normalize_composition(filtered)
+
+
+def _conservative_buildable(
+    composition: Mapping[UnitTypeId, dict], buildable: set[UnitTypeId]
+) -> dict:
+    """One cheap unit type we can build — the conservative stand-in.
+
+    Used when filtering would empty a composition: the ballot has to keep a
+    candidate, and the cheapest thing we can actually produce is the safest
+    thing to keep building.
+    """
+    fielded = [
+        unit_type
+        for unit_type, info in composition.items()
+        if unit_type in buildable
+        and float(info["proportion"]) >= PRODUCTION_MIN_PROPORTION
+    ]
+    pool = fielded or [unit_type for unit_type in composition if unit_type in buildable]
+    if not pool:
+        return {}
+    cheapest = min(pool, key=lambda unit_type: (_unit_price(unit_type), unit_type.name))
+    return {cheapest: {"proportion": 1.0, "priority": 0}}
+
+
+def _fallback_composition(
+    base: Mapping[UnitTypeId, dict], buildable: set[UnitTypeId]
+) -> dict:
+    """The candidate that keeps the ballot alive when nothing else survives.
+
+    Two tiers. The cheapest unit type of the build's own mix we can produce,
+    or — when nothing is buildable at all — the profile's mix as it is. In
+    that degenerate state every composition is equally unexecutable and an
+    empty composition would break ARES' proportion assert, so the profile's
+    own mix stands in and production stays idle until tech arrives.
+    """
+    conservative = _conservative_buildable(base, buildable)
+    if conservative:
+        return conservative
+    if not base:
+        return {}
+    return _normalize_composition(
+        {unit_type: dict(info) for unit_type, info in base.items()}
+    )
+
+
+def _hold_composition(
+    hold: Mapping[UnitTypeId, dict],
+    base: Mapping[UnitTypeId, dict],
+    buildable: set[UnitTypeId],
+) -> dict:
+    """The composition we already build, restricted to what we can build.
+
+    Continuity is the point: the hold candidate needs no new tech and no
+    composition switch, and the priorities stay the profile's build order.
+    The hold is filtered like every other candidate — but it must never die.
+    When the build's base mix does not field the incumbent's units, the
+    incumbent's own buildable part stands in; when even that is empty (the
+    incumbent fields nothing we can build), the build's own cheapest buildable
+    unit keeps the defensive option alive.
+    """
+    composition = {
+        unit_type: info for unit_type, info in hold.items() if unit_type in base
+    }
+    filtered = _buildable_composition(composition, buildable)
+    if filtered:
+        return filtered
+    filtered = _buildable_composition(hold, buildable)
+    if filtered:
+        return filtered
+    conservative = _conservative_buildable(hold, buildable)
+    if conservative:
+        return conservative
+    return _conservative_buildable(base, buildable)
 
 
 def _counter_variants(
     base: Mapping[UnitTypeId, dict],
     values: Mapping[UnitTypeId, float],
     buildable: set[UnitTypeId],
+    translation: Mapping[UnitTypeId, UnitTypeId],
     max_variants: int,
 ) -> list[tuple[UnitTypeId, dict]]:
-    """Profile mixes shifted toward the units that counter the believed enemy."""
+    """Profile mixes shifted toward the units that counter the believed enemy.
+
+    The ideal counter is the unit type the scoring table likes best. When we
+    cannot build it yet, the walk does not give up: it lands on the nearest
+    buildable approximation — the stand-in that sits closest on ARES' tech
+    tree — and shifts toward that instead of dropping the ideal. Every shift
+    target is buildable, so every variant is a composition production can
+    execute.
+    """
     if not base or not values:
         return []
-    ranked = sorted(
-        ((unit_type, value) for unit_type, value in values.items() if unit_type in buildable),
-        key=lambda pair: (-pair[1], pair[0].name),
-    )
+    ranked = sorted(values.items(), key=lambda pair: (-pair[1], pair[0].name))
     variants: list[tuple[UnitTypeId, dict]] = []
-    for unit_type, value in ranked:
+    targets: set[UnitTypeId] = set()
+    for ideal, value in ranked:
         if len(variants) >= max_variants:
             break
         if value <= 0.0:
             break
-        variant = _shift_proportion(base, unit_type, values, buildable)
-        if variant is not None:
-            variants.append((unit_type, variant))
+        target = ideal if ideal in buildable else translation.get(ideal)
+        if target is None or target in targets:
+            continue
+        if values.get(target, 0.0) <= 0.0:
+            # The stand-in does not counter anything — shifting toward it would
+            # buy nothing.
+            continue
+        variant = _shift_proportion(base, target, values, buildable)
+        if variant is None:
+            continue
+        targets.add(target)
+        variants.append((target, variant))
     return variants
 
 

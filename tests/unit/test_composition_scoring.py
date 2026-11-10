@@ -11,6 +11,7 @@ Limitations: the tests pin the arithmetic and the shapes, not the personality
     values themselves — Task 8 refits those from telemetry.
 """
 
+from math import isclose
 from pathlib import Path
 
 import pytest
@@ -28,6 +29,9 @@ from bot.managers.composition_scoring import (
     CostBurden,
     EconomyFit,
     TechSynergy,
+    _buildable_composition,
+    _tech_distance,
+    _translation_map,
     build_candidates,
     composition_cost,
     counter_effectiveness,
@@ -400,8 +404,6 @@ def test_a_counter_variant_shifts_proportion_toward_the_best_counter() -> None:
 
 def test_candidates_are_valid_ares_compositions() -> None:
     """ARES asserts the proportions sum to 1.0 and the priorities are in range."""
-    from math import isclose
-
     profiles = [
         ("profile_0", _composition((UnitTypeId.ZEALOT, 0.5), (UnitTypeId.IMMORTAL, 0.5))),
         ("profile_1", _composition((UnitTypeId.ZEALOT, 0.3), (UnitTypeId.IMMORTAL, 0.7))),
@@ -435,6 +437,295 @@ def test_variants_only_use_units_we_can_build() -> None:
         if candidate.source != "counter":
             continue
         assert set(candidate.composition) == {UnitTypeId.ZEALOT}
+
+
+# ===== BUILDABILITY INVARIANT =====
+
+ROBO_ARMY = {
+    UnitTypeId.IMMORTAL: {"proportion": 0.15, "priority": 1},
+    UnitTypeId.COLOSSUS: {"proportion": 0.15, "priority": 4},
+    UnitTypeId.HIGHTEMPLAR: {"proportion": 0.4, "priority": 0},
+    UnitTypeId.DISRUPTOR: {"proportion": 0.1, "priority": 5},
+    UnitTypeId.STALKER: {"proportion": 0.0, "priority": 2},
+    UnitTypeId.ZEALOT: {"proportion": 0.2, "priority": 3},
+}
+"""The robo-centric mix of the standard PvT profile — the composition that
+won the 2026-11-09 gate with 74% of its counter score coming from units the
+bot had no tech for."""
+
+TECH_SCENARIOS = {
+    "no tech": set(),
+    "gateway only": {UnitTypeId.ZEALOT},
+    "gateway + cyber core": {UnitTypeId.ZEALOT, UnitTypeId.STALKER},
+    "gateway + cyber core + robo": {
+        UnitTypeId.ZEALOT,
+        UnitTypeId.STALKER,
+        UnitTypeId.IMMORTAL,
+    },
+    "full tech": set(ROBO_ARMY),
+}
+"""The tech states a Protoss build walks through on its way to the robo army."""
+
+BUILDABLE_SCENARIOS = {name: ready for name, ready in TECH_SCENARIOS.items() if ready}
+"""The tech states where the bot can build something at all.
+
+The degenerate state (no tech) is outside the buildability contract on
+purpose: nothing is executable there, so the ballot carries the profile's own
+mix as an inert placeholder instead of a buildable composition.
+"""
+
+
+def _robo_profiles() -> list[tuple[str, dict]]:
+    """The standard profile's two compositions."""
+    return [("profile_0", dict(ROBO_ARMY)), ("profile_1", dict(ROBO_ARMY))]
+
+
+def _ready_predicate(ready: set[UnitTypeId]):
+    """A tech_ready predicate for one tech state."""
+    return lambda unit_type: unit_type in ready
+
+
+@pytest.mark.parametrize("scenario", sorted(BUILDABLE_SCENARIOS))
+def test_every_candidate_on_the_ballot_is_fully_buildable(scenario: str) -> None:
+    """The invariant: nothing on the ballot needs tech the bot does not have.
+
+    A candidate production cannot execute must never win the competition —
+    the 2026-11-09 gate failure crowned a robo mix with no Robotics tech and
+    production starved on it.
+    """
+    ready = BUILDABLE_SCENARIOS[scenario]
+    candidates = build_candidates(
+        _robo_profiles(),
+        {"ROACH": 0.6, "HIGHTEMPLAR": 0.4},
+        tech_ready=_ready_predicate(ready),
+    )
+    assert candidates
+    for candidate in candidates:
+        unbuildable = set(candidate.composition) - ready
+        assert not unbuildable, (
+            f"{candidate.name} carries {sorted(unit.name for unit in unbuildable)} "
+            f"without the tech to build them"
+        )
+
+
+@pytest.mark.parametrize("scenario", sorted(TECH_SCENARIOS))
+def test_the_ballot_is_never_empty(scenario: str) -> None:
+    """The counter walk always lands on something — an empty ballot has no winner."""
+    candidates = build_candidates(
+        _robo_profiles(),
+        {"ROACH": 1.0},
+        tech_ready=_ready_predicate(TECH_SCENARIOS[scenario]),
+    )
+    assert candidates, "the ballot must never be empty"
+
+
+def test_the_degenerate_no_tech_ballot_still_lands_on_something() -> None:
+    """With nothing buildable the ballot carries the profile's own mix.
+
+    Every composition is equally unexecutable in that state and an empty
+    composition would break ARES' proportion assert, so the profile's mix
+    stands in — production stays idle until the tech arrives.
+    """
+    candidates = build_candidates(
+        _robo_profiles(), {"ROACH": 1.0}, tech_ready=lambda unit_type: False
+    )
+    assert candidates
+    assert candidates[0].source == "fallback"
+    assert set(candidates[0].composition) == set(ROBO_ARMY)
+    proportions = [
+        float(info["proportion"]) for info in candidates[0].composition.values()
+    ]
+    assert isclose(sum(proportions), 1.0, abs_tol=1e-3)
+
+
+@pytest.mark.parametrize("scenario", sorted(BUILDABLE_SCENARIOS))
+def test_every_candidate_keeps_the_ares_proportion_contract(scenario: str) -> None:
+    """A filtered composition is re-normalized: ARES asserts the sum is 1.0.
+
+    The proportions of a filtered composition no longer add up to 1.0, and a
+    composition that does not add up to 1.0 crashes the SpawnController
+    mid-game — so the re-normalization is mandatory, not cosmetic.
+    """
+    candidates = build_candidates(
+        _robo_profiles(),
+        {"ROACH": 0.6, "HIGHTEMPLAR": 0.4},
+        hold_composition={UnitTypeId.ZEALOT: {"proportion": 1.0, "priority": 0}},
+        tech_ready=_ready_predicate(BUILDABLE_SCENARIOS[scenario]),
+    )
+    assert candidates
+    for candidate in candidates:
+        proportions = [
+            float(info["proportion"]) for info in candidate.composition.values()
+        ]
+        assert isclose(
+            sum(proportions), 1.0, abs_tol=1e-3
+        ), f"{candidate.name} sums to {sum(proportions)}"
+        assert all(value >= 0.0 for value in proportions)
+        for info in candidate.composition.values():
+            assert 0 <= int(info["priority"]) < 11
+
+
+def test_the_robo_mix_never_reaches_the_ballot_without_robotics() -> None:
+    """The gate-failure pin: no Robotics tech, no Robo units on the ballot."""
+    candidates = build_candidates(
+        _robo_profiles(),
+        {"ROACH": 0.6, "HIGHTEMPLAR": 0.4},
+        tech_ready=lambda unit_type: unit_type == UnitTypeId.ZEALOT,
+    )
+    for candidate in candidates:
+        assert not {
+            UnitTypeId.COLOSSUS,
+            UnitTypeId.HIGHTEMPLAR,
+            UnitTypeId.DISRUPTOR,
+            UnitTypeId.IMMORTAL,
+        } & set(candidate.composition)
+
+
+def test_the_hold_candidate_survives_filtering() -> None:
+    """The defensive option must not die when its units become unbuildable."""
+    profiles = [("profile_0", _composition((UnitTypeId.ZEALOT, 1.0)))]
+    hold = {UnitTypeId.COLOSSUS: {"proportion": 1.0, "priority": 0}}
+    candidates = build_candidates(
+        profiles,
+        {"ROACH": 1.0},
+        hold_composition=hold,
+        tech_ready=lambda unit_type: unit_type == UnitTypeId.ZEALOT,
+    )
+    holds = [candidate for candidate in candidates if candidate.source == "hold"]
+    assert holds, "the hold candidate must survive filtering"
+    assert holds[0].composition, "the hold candidate must never be empty"
+    assert set(holds[0].composition) == {UnitTypeId.ZEALOT}
+
+
+def test_the_hold_candidate_keeps_the_incumbents_buildable_units() -> None:
+    """The hold stays inside the build's vocabulary, proportions intact."""
+    profiles = [
+        ("profile_0", _composition((UnitTypeId.ZEALOT, 0.5), (UnitTypeId.STALKER, 0.5)))
+    ]
+    hold = {
+        UnitTypeId.ZEALOT: {"proportion": 0.5, "priority": 0},
+        UnitTypeId.STALKER: {"proportion": 0.5, "priority": 1},
+    }
+    candidates = build_candidates(
+        profiles,
+        {"ROACH": 1.0},
+        hold_composition=hold,
+        tech_ready=lambda unit_type: True,
+    )
+    holds = [candidate for candidate in candidates if candidate.source == "hold"]
+    assert holds
+    assert set(holds[0].composition) == {UnitTypeId.ZEALOT, UnitTypeId.STALKER}
+
+
+def test_the_counter_variant_lands_on_the_nearest_buildable_stand_in() -> None:
+    """An ideal counter we cannot build translates to its nearest stand-in.
+
+    The High Templar is the best counter against a mixed Protoss/Terran army,
+    but without a Templar Archive the walk does not give up: it lands on the
+    Stalker, the buildable unit type that sits closest to the High Templar on
+    ARES' tech tree (the Stalker needs Gateway + Cyber Core, the High
+    Templar two buildings more), and shifts the mix toward it.
+    """
+    profiles = [
+        (
+            "profile_0",
+            _composition(
+                (UnitTypeId.HIGHTEMPLAR, 0.3),
+                (UnitTypeId.STALKER, 0.35),
+                (UnitTypeId.ZEALOT, 0.35),
+            ),
+        ),
+    ]
+    shares = {"MUTALISK": 0.5, "MARINE": 0.5}
+    candidates = build_candidates(
+        profiles,
+        shares,
+        tech_ready=lambda unit_type: unit_type
+        in {UnitTypeId.ZEALOT, UnitTypeId.STALKER},
+    )
+    variants = [candidate for candidate in candidates if candidate.source == "counter"]
+    assert variants, "the unbuildable ideal must still land on a stand-in"
+    variant = variants[0].composition
+    assert UnitTypeId.STALKER in variant
+    assert UnitTypeId.HIGHTEMPLAR not in variant
+
+    # The variant is built from the buildable part of the profile — the High
+    # Templar is gone and the rest re-balanced — so the shift is measured
+    # against that base, not against the raw profile.
+    buildable_base = _buildable_composition(
+        profiles[0][1], {UnitTypeId.ZEALOT, UnitTypeId.STALKER}
+    )
+    assert (
+        variant[UnitTypeId.STALKER]["proportion"]
+        > buildable_base[UnitTypeId.STALKER]["proportion"]
+    )
+    assert (
+        variant[UnitTypeId.ZEALOT]["proportion"]
+        < buildable_base[UnitTypeId.ZEALOT]["proportion"]
+    )
+
+
+def test_the_stand_in_is_the_nearest_unit_on_the_tech_tree() -> None:
+    """The tech tree decides who stands in — the counter value only breaks ties.
+
+    A Colossus we cannot build stands in the Immortal (one building away on
+    ARES' tech tree), not the Zealot — even when the Zealot would counter the
+    enemy better.
+    """
+    translation = _translation_map(
+        [UnitTypeId.COLOSSUS, UnitTypeId.IMMORTAL, UnitTypeId.ZEALOT],
+        {UnitTypeId.COLOSSUS, UnitTypeId.IMMORTAL, UnitTypeId.ZEALOT},
+        {UnitTypeId.IMMORTAL, UnitTypeId.ZEALOT},
+        {UnitTypeId.IMMORTAL: 0.0, UnitTypeId.ZEALOT: 10.0},
+    )
+    assert translation[UnitTypeId.COLOSSUS] == UnitTypeId.IMMORTAL
+    assert UnitTypeId.IMMORTAL not in translation, "a buildable unit needs no stand-in"
+
+
+def test_the_translation_is_data_driven_from_the_ares_tech_tree() -> None:
+    """The stand-in distance is measured on ARES' own tech requirements.
+
+    The Immortal needs Gateway + Cyber Core + Robotics Facility; the Stalker
+    needs Gateway + Cyber Core. The Immortal is the nearer neighbour of a
+    Colossus (one building away), so it is the one that stands in.
+    """
+    assert _tech_distance(UnitTypeId.COLOSSUS, UnitTypeId.IMMORTAL) == 1
+    assert _tech_distance(UnitTypeId.COLOSSUS, UnitTypeId.STALKER) == 2
+    assert _tech_distance(UnitTypeId.COLOSSUS, UnitTypeId.ZEALOT) == 3
+    # A Warp Gate is a Gateway — the tech tree counts them as one node.
+    assert _tech_distance(UnitTypeId.STALKER, UnitTypeId.ZEALOT) == 1
+
+
+def test_the_nearest_stand_in_wins_over_the_better_counter() -> None:
+    """Proximity decides the stand-in; the counter value only breaks ties.
+
+    The Stalker counters the enemy better than the Immortal here, but the
+    Immortal is the neighbour of the ideal on the tech tree — the stand-in
+    has to sit on the path we are investing in, not on the better matchup.
+    """
+    translation = _translation_map(
+        [UnitTypeId.COLOSSUS],
+        {
+            UnitTypeId.COLOSSUS,
+            UnitTypeId.IMMORTAL,
+            UnitTypeId.STALKER,
+            UnitTypeId.ZEALOT,
+        },
+        {UnitTypeId.IMMORTAL, UnitTypeId.STALKER, UnitTypeId.ZEALOT},
+        {UnitTypeId.STALKER: 10.0, UnitTypeId.IMMORTAL: 0.0, UnitTypeId.ZEALOT: 0.0},
+    )
+    assert translation[UnitTypeId.COLOSSUS] == UnitTypeId.IMMORTAL
+
+
+def test_only_the_builds_own_vocabulary_can_stand_in() -> None:
+    """A stand-in the build does not field would be a strategy change."""
+    translation = _translation_map(
+        [UnitTypeId.COLOSSUS],
+        {UnitTypeId.COLOSSUS, UnitTypeId.ZEALOT},
+        {UnitTypeId.ZEALOT, UnitTypeId.IMMORTAL},
+        {},
+    )
+    assert translation[UnitTypeId.COLOSSUS] == UnitTypeId.ZEALOT
 
 
 # ===== RANKING =====
