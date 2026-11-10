@@ -115,8 +115,7 @@ class PiG_Bot(AresBot):
         self._is_building = False
 
         # Build runner stall tracking (exit valves read these every step)
-        self._stall_start_time = 0.0
-        self._last_build_progress_key: tuple | None = None
+        self._deadlock_since: float | None = None
 
         # Reaction manager: owns all reaction state and routing
         self.reaction_manager = ReactionManager()
@@ -563,20 +562,40 @@ class PiG_Bot(AresBot):
         # A stuck build runner blocks handle_macro() entirely, so these run in
         # ALL game states — not just early game.
         if not self.build_order_runner.build_completed:
-            # Fast valve: no step progress for N seconds while the next step's
-            # supply gate is above us. If the gate were passed, the wait would
-            # be affordability (e.g. banking for an expansion) — legitimate.
-            from bot.constants import BUILD_STALL_FORCE_COMPLETE_SECONDS
             runner = self.build_order_runner
-            progress_key = (runner.build_step, runner._temporary_build_step, runner.current_step_started)
-            if progress_key != self._last_build_progress_key:
-                self._stall_start_time = self.time
-                self._last_build_progress_key = progress_key
-            elif (not runner.current_step_started
-                  and runner.build_order
-                  and self.supply_used < self._current_gate_supply(runner)
-                  and self.time - self._stall_start_time > BUILD_STALL_FORCE_COMPLETE_SECONDS):
-                self._force_complete_build(reason=f"stalled {self.time - self._stall_start_time:.0f}s below supply gate {self._current_gate_supply(runner)} at {self.supply_used} supply")
+            # Deadlock signature — ground truth from ARES/python-sc2 state,
+            # no proxies or healthy-situation exceptions:
+            #   1. NOTHING in flight across every activity bucket (no
+            #      structures warping, no units materializing, no
+            #      train/research orders, no workers en route to build)
+            #   2. bank above probe cost — a healthy runner always snaps the
+            #      bank back down by training workers, so sustained silence
+            #      with spendable money means nothing is spendable
+            #   3. supply below the effective step's gate — protects
+            #      legitimate banking (expansion waits have the gate passed)
+            #   4. held for BUILD_STALL_CONFIRM_SECONDS — absorbs the 1-2
+            #      frame lag between the runner issuing an order and that
+            #      order appearing in unit/manager state
+            from bot.constants import BUILD_STALL_CONFIRM_SECONDS, BUILD_STALL_DEADLOCK_BANK
+            nothing_in_flight = (
+                not self.structures.not_ready
+                and not self.units.not_ready
+                and not any(s.orders for s in self.structures)
+                and not self.mediator.get_building_tracker_dict
+            )
+            below_gate = (runner.build_order
+                          and self.supply_used < self._current_gate_supply(runner))
+            if nothing_in_flight and below_gate and self.minerals > BUILD_STALL_DEADLOCK_BANK:
+                if self._deadlock_since is None:
+                    self._deadlock_since = self.time
+                elif self.time - self._deadlock_since >= BUILD_STALL_CONFIRM_SECONDS:
+                    self._force_complete_build(
+                        reason=f"deadlock: nothing in flight for {self.time - self._deadlock_since:.0f}s, "
+                               f"{self.minerals} minerals at {self.supply_used} supply "
+                               f"(gate {self._current_gate_supply(runner)})"
+                    )
+            else:
+                self._deadlock_since = None
 
             # Backstop valves: a *started* step that got stuck (placement
             # failure, builder died) banks money because nothing spends it.

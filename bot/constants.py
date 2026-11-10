@@ -1189,16 +1189,24 @@ Game 1087 banked gas while mineral-banked at 85 — the mineral-only check
 never fired. Every current protoss build burns gas continuously once
 assimilators are up, so 500 banked mid-build is abnormal in all of them."""
 
-BUILD_STALL_FORCE_COMPLETE_SECONDS = 30.0
-"""Seconds without step progress below an unreachable supply gate that
-force-completes the build order.
+BUILD_STALL_CONFIRM_SECONDS = 3.0
+"""How long the deadlock signature must hold before force-completing.
 
-The fast valve: the runner deadlocks when `supply_used < start_at_supply`
-and supply can't climb (lost pylon timing, worker deaths). Waiting on
-affordability (e.g. banking for an expansion) always has the gate passed,
-so a healthy build can never satisfy the stall condition — banking is
-protected by the check itself, not by a tuned threshold. 1081 stalled for
-49s before the mineral valve saved it; 30s exits ~19s sooner."""
+Pure API-noise insurance: manager state (building tracker, orders) lands a
+frame after the runner issues commands, so a 1-2 frame flicker of "nothing
+in flight" is possible during normal transitions. Three seconds of
+continuous silence is not."""
+
+BUILD_STALL_DEADLOCK_BANK = 50
+"""Probe cost — the cheapest action a healthy runner can always take.
+
+With nothing in flight (no structures building, no workers en route, no
+units materializing, no production/research orders, no step started), a
+healthy runner always spends bank at or below this by training workers
+(ConstantWorkerProductionTill). Bank above it while fully silent means
+nothing is spendable: either supply-blocked below a gate with no reachable
+pylon step, or production-starved past the worker cap. That is the
+deadlock signature — it cannot occur in a functioning build."""
 
 
 # ===== BUILD PROFILES =====
