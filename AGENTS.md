@@ -168,7 +168,7 @@ If risk ≥ medium, add/adjust tests accordingly.
 
 ### Cython Extensions
 
-The `cython_extensions` package ships with ARES and provides fast C-compiled helpers. **Always prefer `cy_*` over plain Python equivalents** for any hot-path geometry or unit-query work.
+The `cython_extensions` package ships with ARES and provides fast C-compiled helpers (~4x the Python equivalent: `cy_attack_ready` 1.46µs vs 5.66µs). **Before hand-rolling any per-frame or per-unit loop** (distance sweeps, targeting geometry, attack-readiness checks, center-of-mass, AOE placement), check the full surface at https://aressc2.github.io/cython-extensions-sc2/ and prefer the `cy_*` function if one fits. No new dependency — ares-sc2 already depends on these. If none fits, write plain Python but note the per-frame cost in a comment. Respect the docs' own warnings: some functions are costly and must not be spammed per-unit per-frame (`cy_find_aoe_position` — gate it behind ability-ready and range checks).
 
 | Function | Import | Purpose |
 |---|---|---|
@@ -359,10 +359,3 @@ Pass custom grids into any ARES behavior or pathing call exactly like the built-
 - **Main army redirects only for major threats** (severity ≥ level 7 in `assess_threat()`).
 - `assess_threat()` lives in `bot/managers/reactions.py`; keep classification logic there.
 - Graduated response prevents the oscillation loop: small threat appears → entire army retreats → threat gone → entire army advances → repeat.
-## Performance & Cython Extensions
-
-- **Before hand-rolling unit-set loops** (distance sweeps, targeting geometry, attack-readiness checks, center-of-mass, AOE placement), check the ARES cython extensions surface first: https://aressc2.github.io/cython-extensions-sc2/
-- The `cy_*` functions are compiled and roughly 4x faster than the Python equivalent (e.g. `cy_attack_ready` 1.46µs vs 5.66µs). Prefer them in any per-frame or per-unit hot path — combat queries, threat distance checks, formation math.
-- Respect the docs' own warnings: some functions are costly and must not be spammed per-unit per-frame (`cy_find_aoe_position` — gate it behind ability-ready and range checks, as its example shows).
-- The framework (ares-sc2, vendored in-repo) already depends on these; using them adds no dependency.
-- If a `cy_*` function fits the problem, use it. If none fits, write plain Python but note the per-frame cost in a comment.
