@@ -13,6 +13,9 @@ Key Decisions: The scoring table is the core base score, not a post-decision
                Buildability invariant: every candidate on the ballot is fully
                buildable and the ballot is never empty — a composition
                production cannot execute never wins the competition.
+               The conservative stand-in is a last resort, so engaging it is an
+               alarm, not a silent substitution — every engagement emits the
+               fallback_engaged telemetry event (Task 9 retires the mechanism).
 Limitations: The magnitudes are seeds — Task 8 refits them from telemetry. The
                scorer re-scores on the macro cadence (a belief change or every N
                cycles), never per frame. The nearest-reachable translation runs
@@ -52,6 +55,7 @@ from bot.utilities.reasoner import (
     load_curve_params,
     score,
 )
+from bot.utilities.telemetry import log_event_no_sample
 
 # ===== CANDIDATE SET =====
 
@@ -86,6 +90,18 @@ FALLBACK_SOURCE = "fallback"
 
 FALLBACK_NAME = "fallback"
 """Name of the conservative buildable candidate."""
+
+FALLBACK_PATH_BASE = "base"
+"""The conservative stand-in filled the ballot-keepalive candidate."""
+
+FALLBACK_PATH_HOLD = "hold"
+"""The conservative stand-in filled the defensive (hold) candidate."""
+
+FALLBACK_REASON_CONSERVATIVE = "conservative_buildable"
+"""The stand-in picked the cheapest unit type we can produce."""
+
+FALLBACK_REASON_NOTHING_BUILDABLE = "nothing_buildable"
+"""Nothing in the mix can be produced at all — the mix stands in unfiltered."""
 
 
 def _build_tech_equivalents() -> dict[UnitTypeId, UnitTypeId]:
@@ -549,6 +565,7 @@ def build_candidates(
     tech_ready: Callable[[UnitTypeId], bool] | None = None,
     cap: int = CANDIDATE_CAP,
     max_variants: int = MAX_COUNTER_VARIANTS,
+    game_time: float | None = None,
 ) -> list[CompositionCandidate]:
     """Build the ballot of compositions that compete this cycle.
 
@@ -569,6 +586,9 @@ def build_candidates(
     composition switch. It is deliberately *not* the army's current mix — that
     is a transient state, and a cheap early army would win the price terms and
     stall the build's intended composition.
+
+    `game_time` is the game clock the fallback alarm is stamped with — the
+    engagement is a game-time event, not a wall-clock one.
     """
     candidates: list[CompositionCandidate] = []
     signatures: set[tuple] = set()
@@ -609,7 +629,7 @@ def build_candidates(
         _add(name, _buildable_composition(composition, buildable), PROFILE_SOURCE)
 
     if hold_composition:
-        hold = _hold_composition(hold_composition, base, buildable)
+        hold = _hold_composition(hold_composition, base, buildable, game_time)
         if hold:
             # The hold candidate is never deduplicated: it means "keep building
             # what we decided to build", and the cap must not squeeze the
@@ -632,7 +652,11 @@ def build_candidates(
         _add(f"counter_{unit_type.name}", variant, COUNTER_SOURCE)
 
     if not candidates:
-        _add(FALLBACK_NAME, _fallback_composition(base, buildable), FALLBACK_SOURCE)
+        _add(
+            FALLBACK_NAME,
+            _fallback_composition(base, buildable, game_time),
+            FALLBACK_SOURCE,
+        )
 
     return candidates[:cap]
 
@@ -734,14 +758,46 @@ def _buildable_composition(
     return _normalize_composition(filtered)
 
 
+def _report_fallback_engagement(
+    path: str,
+    unit: UnitTypeId | None,
+    game_time: float | None = None,
+    reason: str = FALLBACK_REASON_CONSERVATIVE,
+) -> None:
+    """Emit the fallback alarm — the plan's observable-fallback rule.
+
+    A fallback that engages without a trace hides a broken primary path, so
+    every engagement is an event: which path engaged (base or hold), the
+    candidate the stand-in replaced and the unit it pinned the build to. The
+    event is never sampled — the Task 8 audit counts engagements, and a
+    sampled-out alarm would undercount the very failure it exists to expose.
+    """
+    log_event_no_sample(
+        subsystem="macro",
+        action="fallback_engaged",
+        reason=reason,
+        path=path,
+        source=FALLBACK_SOURCE if path == FALLBACK_PATH_BASE else HOLD_SOURCE,
+        unit=unit.name if unit is not None else None,
+        _ts=game_time,
+    )
+
+
 def _conservative_buildable(
-    composition: Mapping[UnitTypeId, dict], buildable: set[UnitTypeId]
+    composition: Mapping[UnitTypeId, dict],
+    buildable: set[UnitTypeId],
+    path: str,
+    game_time: float | None = None,
 ) -> dict:
     """One cheap unit type we can build — the conservative stand-in.
 
     Used when filtering would empty a composition: the ballot has to keep a
     candidate, and the cheapest thing we can actually produce is the safest
     thing to keep building.
+
+    "Cheapest buildable = safest" is a seed judgment standing in for a real
+    measure, so engaging it is an alarm (the plan's fallback rule) and not a
+    silent substitution — Task 9 retires it with the tech-proximity semi-tree.
     """
     fielded = [
         unit_type
@@ -753,11 +809,14 @@ def _conservative_buildable(
     if not pool:
         return {}
     cheapest = min(pool, key=lambda unit_type: (_unit_price(unit_type), unit_type.name))
+    _report_fallback_engagement(path, cheapest, game_time)
     return {cheapest: {"proportion": 1.0, "priority": 0}}
 
 
 def _fallback_composition(
-    base: Mapping[UnitTypeId, dict], buildable: set[UnitTypeId]
+    base: Mapping[UnitTypeId, dict],
+    buildable: set[UnitTypeId],
+    game_time: float | None = None,
 ) -> dict:
     """The candidate that keeps the ballot alive when nothing else survives.
 
@@ -765,13 +824,19 @@ def _fallback_composition(
     or — when nothing is buildable at all — the profile's mix as it is. In
     that degenerate state every composition is equally unexecutable and an
     empty composition would break ARES' proportion assert, so the profile's
-    own mix stands in and production stays idle until tech arrives.
+    own mix stands in and production stays idle until tech arrives. Both
+    tiers are last resorts, so both raise the alarm.
     """
-    conservative = _conservative_buildable(base, buildable)
+    conservative = _conservative_buildable(
+        base, buildable, FALLBACK_PATH_BASE, game_time
+    )
     if conservative:
         return conservative
     if not base:
         return {}
+    _report_fallback_engagement(
+        FALLBACK_PATH_BASE, None, game_time, FALLBACK_REASON_NOTHING_BUILDABLE
+    )
     return _normalize_composition(
         {unit_type: dict(info) for unit_type, info in base.items()}
     )
@@ -781,6 +846,7 @@ def _hold_composition(
     hold: Mapping[UnitTypeId, dict],
     base: Mapping[UnitTypeId, dict],
     buildable: set[UnitTypeId],
+    game_time: float | None = None,
 ) -> dict:
     """The composition we already build, restricted to what we can build.
 
@@ -790,7 +856,8 @@ def _hold_composition(
     When the build's base mix does not field the incumbent's units, the
     incumbent's own buildable part stands in; when even that is empty (the
     incumbent fields nothing we can build), the build's own cheapest buildable
-    unit keeps the defensive option alive.
+    unit keeps the defensive option alive — the conservative stand-in, which
+    raises the alarm like every other fallback engagement.
     """
     composition = {
         unit_type: info for unit_type, info in hold.items() if unit_type in base
@@ -801,10 +868,12 @@ def _hold_composition(
     filtered = _buildable_composition(hold, buildable)
     if filtered:
         return filtered
-    conservative = _conservative_buildable(hold, buildable)
+    conservative = _conservative_buildable(
+        hold, buildable, FALLBACK_PATH_HOLD, game_time
+    )
     if conservative:
         return conservative
-    return _conservative_buildable(base, buildable)
+    return _conservative_buildable(base, buildable, FALLBACK_PATH_HOLD, game_time)
 
 
 def _counter_variants(
@@ -1098,6 +1167,7 @@ class CompositionScorer:
             context.belief.enemy_composition,
             hold_composition=self._incumbent_composition,
             tech_ready=bot.tech_ready_for_unit,
+            game_time=bot.time,
         )
         ranking = self.rank(candidates, context, incumbent=self._incumbent)
         by_name = {candidate.name: candidate for candidate in candidates}

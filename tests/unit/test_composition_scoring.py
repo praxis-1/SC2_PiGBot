@@ -11,6 +11,7 @@ Limitations: the tests pin the arithmetic and the shapes, not the personality
     values themselves — Task 8 refits those from telemetry.
 """
 
+import json
 from math import isclose
 from pathlib import Path
 
@@ -893,3 +894,144 @@ def test_the_bot_state_has_no_economy_switch_flag() -> None:
     """No one-way flag is left on the bot either."""
     bot_source = (REPO_ROOT / "bot" / "bot.py").read_text(encoding="utf-8")
     assert "_economy_switch_triggered" not in bot_source
+
+
+# ===== FALLBACK ALARM =====
+
+
+@pytest.fixture
+def telem(monkeypatch) -> None:
+    """Put the telemetry channel in a live state that prints to stdout.
+
+    The alarm rides the bot's own TELEM channel, so the test reads that
+    channel instead of the emitter's internals — no game, no file I/O.
+    """
+    from bot.utilities import telemetry
+
+    monkeypatch.setattr(telemetry, "_initialized", True)
+    monkeypatch.setattr(
+        telemetry,
+        "_event_context",
+        {"env": "ladder", "match_id": "unit-test", "schema_version": 1},
+    )
+
+
+def _telem_events(capsys) -> list[dict]:
+    """The TELEM records printed on the channel since the last read."""
+    printed = capsys.readouterr().out
+    return [
+        json.loads(line[len("TELEM ") :])
+        for line in printed.splitlines()
+        if line.startswith("TELEM ")
+    ]
+
+
+def test_the_fallback_alarm_fires_when_the_conservative_stand_in_takes_over(
+    telem, capsys
+) -> None:
+    """The seed judgment standing in for a real measure is an alarm.
+
+    The mix has nothing we can build above the production floor, so the
+    conservative stand-in pins the build to the one unit type we can produce.
+    """
+    profiles = [
+        (
+            "profile_0",
+            {
+                UnitTypeId.STALKER: {"proportion": 0.0, "priority": 0},
+                UnitTypeId.IMMORTAL: {"proportion": 1.0, "priority": 1},
+            },
+        )
+    ]
+    build_candidates(
+        profiles,
+        {"ROACH": 1.0},
+        tech_ready=lambda unit_type: unit_type == UnitTypeId.STALKER,
+        game_time=42.0,
+    )
+
+    events = _telem_events(capsys)
+    assert len(events) == 1
+    event = events[0]
+    assert event["subsystem"] == "macro"
+    assert event["action"] == "fallback_engaged"
+    assert event["reason"] == "conservative_buildable"
+    assert event["path"] == "base"
+    assert event["source"] == "fallback"
+    assert event["unit"] == "STALKER"
+    assert event["ts"] == 42.0
+
+
+def test_the_fallback_alarm_names_the_hold_path(telem, capsys) -> None:
+    """The defensive option's own fallback is alarmed under its own path.
+
+    The incumbent's composition cannot be built, so the conservative stand-in
+    fills the hold candidate — the hold path's own last resort.
+    """
+    profiles = [
+        (
+            "profile_0",
+            {
+                UnitTypeId.STALKER: {"proportion": 0.0, "priority": 0},
+                UnitTypeId.IMMORTAL: {"proportion": 1.0, "priority": 1},
+            },
+        )
+    ]
+    hold = {
+        UnitTypeId.STALKER: {"proportion": 0.0, "priority": 0},
+        UnitTypeId.IMMORTAL: {"proportion": 1.0, "priority": 1},
+    }
+    build_candidates(
+        profiles,
+        {"ROACH": 1.0},
+        hold_composition=hold,
+        tech_ready=lambda unit_type: unit_type == UnitTypeId.STALKER,
+        game_time=51.5,
+    )
+
+    events = _telem_events(capsys)
+    assert len(events) == 1
+    assert events[0]["action"] == "fallback_engaged"
+    assert events[0]["reason"] == "conservative_buildable"
+    assert events[0]["path"] == "hold"
+    assert events[0]["source"] == "hold"
+    assert events[0]["unit"] == "STALKER"
+    assert events[0]["ts"] == 51.5
+
+
+def test_the_fallback_alarm_fires_when_nothing_is_buildable(telem, capsys) -> None:
+    """The degenerate state — nothing we can produce at all — is alarmed too.
+
+    The profile's own mix stands in as an inert placeholder there, which is
+    the last resort of the last resort — it must not be a silent one.
+    """
+    build_candidates(
+        _robo_profiles(),
+        {"ROACH": 1.0},
+        tech_ready=lambda unit_type: False,
+        game_time=12.0,
+    )
+
+    events = _telem_events(capsys)
+    assert len(events) == 1
+    assert events[0]["action"] == "fallback_engaged"
+    assert events[0]["reason"] == "nothing_buildable"
+    assert events[0]["path"] == "base"
+    assert events[0]["source"] == "fallback"
+    assert events[0]["unit"] is None
+    assert events[0]["ts"] == 12.0
+
+
+def test_the_fallback_alarm_stays_quiet_when_the_primary_path_stands(
+    telem, capsys
+) -> None:
+    """A buildable mix is the primary path — no fallback, no alarm."""
+    profiles = [("profile_0", _composition((UnitTypeId.ZEALOT, 1.0)))]
+    build_candidates(
+        profiles,
+        {"ROACH": 1.0},
+        tech_ready=lambda unit_type: unit_type == UnitTypeId.ZEALOT,
+        game_time=30.0,
+    )
+
+    assert _telem_events(capsys) == []
