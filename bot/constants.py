@@ -1180,9 +1180,27 @@ FREEFLOW_BANK_THRESHOLD = 800
 BUILD_FORCE_COMPLETE_MINERALS = 1000
 """Mineral bank that force-completes the opening build order.
 
-Fail-safe in bot.py: if minerals exceed this and the build runner hasn't
-finished, we mark it complete so macro freeflow can take over. A stuck
-build runner blocks handle_macro() entirely, so this runs in all game states."""
+Backstop valve (bot.py): if a *started* step got stuck (placement failed,
+builder died, structure cancelled) minerals bank because nothing spends
+them. Fast exit for the common deadlock is the stall detector below."""
+
+BUILD_FORCE_COMPLETE_VESPENE = 500
+"""Gas bank that force-completes the opening build order (backstop, see above).
+
+Game 1087 banked gas while mineral-banked at 85 — the mineral-only check
+never fired. Every current protoss build burns gas continuously once
+assimilators are up, so 500 banked mid-build is abnormal in all of them."""
+
+BUILD_STALL_FORCE_COMPLETE_SECONDS = 30.0
+"""Seconds without step progress below an unreachable supply gate that
+force-completes the build order.
+
+The fast valve: the runner deadlocks when `supply_used < start_at_supply`
+and supply can't climb (lost pylon timing, worker deaths). Waiting on
+affordability (e.g. banking for an expansion) always has the gate passed,
+so a healthy build can never satisfy the stall condition — banking is
+protected by the check itself, not by a tuned threshold. 1081 stalled for
+49s before the mineral valve saved it; 30s exits ~19s sooner."""
 
 
 # ===== BUILD PROFILES =====

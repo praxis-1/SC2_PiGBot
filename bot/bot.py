@@ -1,4 +1,14 @@
 # bot.py
+"""Main AresBot subclass wiring all bot modules together.
+
+Purpose: per-frame orchestration — combat, scouting, reactions, and the
+    build-runner exit valves that hand off to macro when the opening stalls.
+Key Decisions: macro is locked out until the opening completes, so the exit
+    valves (stall detector + bank backstops) run in all game states and are
+    the only guaranteed escape from a supply-gated build deadlock.
+Limitations: valve thresholds are global constants; per-build tuning would
+    need profile support (see constants.py BUILD_* group).
+"""
 
 from typing import Optional
 from itertools import cycle, chain
@@ -49,7 +59,7 @@ from bot.utilities.use_disruptor_nova import UseDisruptorNova
 from bot.utilities.nova_manager import NovaManager
 from bot.utilities.performance_monitor import PerformanceMonitor
 from bot.utilities.game_report import print_end_game_report, print_startup_report, print_periodic_intel_report, get_replay_tags_to_send, emit_match_record
-from bot.utilities.telemetry import init_context, reset as telemetry_reset
+from bot.utilities.telemetry import init_context, reset as telemetry_reset, log_transition
 from bot.belief import BeliefUpdater, BeliefState, create_empty_belief_state
 
 
@@ -103,6 +113,10 @@ class PiG_Bot(AresBot):
         self._rush_time_seconds = 0.0  # Rush time calculated in on_start
         self._under_attack = False
         self._is_building = False
+
+        # Build runner stall tracking (exit valves read these every step)
+        self._stall_start_time = 0.0
+        self._last_build_progress_key: tuple | None = None
 
         # Reaction manager: owns all reaction state and routing
         self.reaction_manager = ReactionManager()
@@ -342,6 +356,38 @@ class PiG_Bot(AresBot):
                        f"{cat_names[best_cat]}. GLHF!")
             await self.chat_send(msg)
 
+    def _force_complete_build(self, reason: str) -> None:
+        """Mark the opening build order complete and hand off to macro.
+
+        All three exit valves (stall detector, mineral bank, gas bank) funnel
+        here so the recovery path is identical to the pre-existing fail-safe
+        and each firing is greppable from logs/telemetry.
+        """
+        if self.build_order_runner.build_completed:
+            return
+        self.build_order_runner.set_build_completed()
+        print(f"Build order force-completed at {self.time:.1f}s: {reason}")
+        log_transition(
+            subsystem="build_runner",
+            action="force_complete",
+            reason=reason,
+            key="build_runner_state",
+            value="force_completed",
+            _ts=self.time,
+        )
+
+    def _current_gate_supply(self, runner) -> int:
+        """Supply gate of the step the runner is actually working on.
+
+        The look-ahead commits to a temporary step (`_temporary_build_step`)
+        and freezes there; if that step is gate-blocked it's the same
+        deadlock. Falls back to the current step, then 0 (never blocks).
+        """
+        idx = runner._temporary_build_step if runner._temporary_build_step != -1 else runner.build_step
+        if 0 <= idx < len(runner.build_order):
+            return runner.build_order[idx].start_at_supply
+        return 0
+
     async def on_step(self, iteration: int) -> None:
         """
         Main loop executed each game step. Calls out to macro, combat, scouting,
@@ -508,14 +554,32 @@ class PiG_Bot(AresBot):
         # Update game state based on game time
         current_time = self.time
         
-        from bot.constants import BUILD_FORCE_COMPLETE_MINERALS
+        # ===== Build runner exit valves =====
+        # A stuck build runner blocks handle_macro() entirely, so these run in
+        # ALL game states — not just early game.
+        if not self.build_order_runner.build_completed:
+            # Fast valve: no step progress for N seconds while the next step's
+            # supply gate is above us. If the gate were passed, the wait would
+            # be affordability (e.g. banking for an expansion) — legitimate.
+            from bot.constants import BUILD_STALL_FORCE_COMPLETE_SECONDS
+            runner = self.build_order_runner
+            progress_key = (runner.build_step, runner._temporary_build_step, runner.current_step_started)
+            if progress_key != self._last_build_progress_key:
+                self._stall_start_time = self.time
+                self._last_build_progress_key = progress_key
+            elif (not runner.current_step_started
+                  and runner.build_order
+                  and self.supply_used < self._current_gate_supply(runner)
+                  and self.time - self._stall_start_time > BUILD_STALL_FORCE_COMPLETE_SECONDS):
+                self._force_complete_build(reason=f"stalled {self.time - self._stall_start_time:.0f}s below supply gate {self._current_gate_supply(runner)} at {self.supply_used} supply")
 
-        # Fail-safe: Force complete build if banking too many minerals.
-        # Runs in ALL game states — a stuck build runner blocks handle_macro()
-        # entirely, so this must not be gated to early game only.
-        if self.minerals > BUILD_FORCE_COMPLETE_MINERALS and not self.build_order_runner.build_completed:
-            self.build_order_runner.set_build_completed()
-            print(f"Build order force-completed at {self.time:.1f}s due to high minerals")
+            # Backstop valves: a *started* step that got stuck (placement
+            # failure, builder died) banks money because nothing spends it.
+            from bot.constants import BUILD_FORCE_COMPLETE_MINERALS, BUILD_FORCE_COMPLETE_VESPENE
+            if self.minerals > BUILD_FORCE_COMPLETE_MINERALS:
+                self._force_complete_build(reason=f"banked {self.minerals} minerals")
+            elif self.vespene > BUILD_FORCE_COMPLETE_VESPENE:
+                self._force_complete_build(reason=f"banked {self.vespene} vespene")
         
         if current_time >= self.mid_game_threshold:
             self.game_state = 2  # late game
