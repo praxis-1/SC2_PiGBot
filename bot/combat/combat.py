@@ -36,7 +36,14 @@ from bot.constants import (
     MAP_CROSSING_SUCCESS_DISTANCE,
     UNIT_ENEMY_DETECTION_RANGE,
     GATEKEEPER_DETECTION_RANGE,
-    GATEKEEPER_MOVE_DISTANCE,
+    GATEKEEPER_ZEALOT_RADIUS,
+    GATEKEEPER_CLEARANCE_MARGIN,
+    GATEKEEPER_PARK_DISTANCES,
+    GATEKEEPER_PARK_MIN_DISTANCE,
+    GATEKEEPER_PARK_LATERAL_OFFSETS,
+    GATEKEEPER_CLEARANCE_SEARCH_RADIUS,
+    GATEKEEPER_POSITION_TOLERANCE,
+    GATEKEEPER_ORDER_TOLERANCE,
     WARP_PRISM_FOLLOW_DISTANCE,
     WARP_PRISM_FOLLOW_OFFSET,
     WARP_PRISM_UNIT_CHECK_RANGE,
@@ -112,6 +119,7 @@ from bot.utilities.debug import (
 )
 from bot.intel import get_enemy_intel_quality, get_sim_static_defense
 from bot.managers.structure_manager import use_mass_recall
+from bot.utilities.telemetry import log_transition
 
 from cython_extensions import (
     cy_pick_enemy_target, cy_closest_to, cy_distance_to, cy_distance_to_squared, cy_in_attack_range, cy_find_units_center_mass,
@@ -1353,96 +1361,170 @@ def control_main_army(bot, main_army: Units, target: Point2, squads: list[UnitSq
 
     return pos_of_main_squad
 
-def _has_pending_build_near(bot, position: Point2, radius: float = 2.5) -> bool:
-    """
-    Check if any worker with a build order is within radius of position.
-    Considers both the build target location and the worker's current position.
-    """
-    nearby_workers = bot.workers.closer_than(radius + 5, position)
-    
-    for worker in nearby_workers:
-        if not worker.orders:
-            continue
-        order = worker.orders[0]
-        if order.target and isinstance(order.target, Point2):
-            if cy_distance_to(order.target, position) < radius:
-                return True
-            if cy_distance_to(worker.position, position) < radius:
-                return True
-    return False
+def _gatekeeper_structures(bot, position: Point2) -> list[Unit]:
+    """Structures that could crowd a parking spot: our own (including the ones still
+    under construction) and the enemy's."""
+    return list(bot.structures.closer_than(GATEKEEPER_CLEARANCE_SEARCH_RADIUS, position)) + list(
+        bot.enemy_structures.closer_than(GATEKEEPER_CLEARANCE_SEARCH_RADIUS, position)
+    )
 
 
-def _is_position_clear(bot, position: Point2, radius: float = 2.5) -> bool:
+def _clearance_to_structures(position: Point2, structures: list[Unit]) -> float:
+    """Gap between a tile and the closest structure footprint.
+
+    Negative means the tile overlaps a footprint. A zealot standing there is shoved
+    by the engine, which is what turned the old fallback into a tug-of-war with the
+    probe that was building.
     """
-    Check if position is clear of structures (including those under construction).
+    gap: float = math.inf
+    for structure in structures:
+        footprint = structure.footprint_radius or structure.radius or 0.0
+        gap = min(
+            gap,
+            cy_distance_to(structure.position, position) - footprint - GATEKEEPER_ZEALOT_RADIUS,
+        )
+    return gap
+
+
+def _is_walkable(bot, position: Point2) -> bool:
+    """False on tiles a zealot cannot stand on (rocks, cliffs, closed edges)."""
+    return cy_in_pathing_grid_ma(bot.mediator.get_ground_grid, position)
+
+
+def _parking_spot_is_free(bot, position: Point2, gate_pos: Point2, structures: list[Unit]) -> bool:
+    """A spot is free when the zealot fits, the tile is walkable and the gap stays clear.
+
+    The gap itself never qualifies: a probe may be about to build there.
     """
-    nearby_structures = bot.structures.closer_than(radius, position)
-    if nearby_structures:
+    if cy_distance_to(position, gate_pos) < GATEKEEPER_PARK_MIN_DISTANCE:
         return False
-    return True
+    if not _is_walkable(bot, position):
+        return False
+    return _clearance_to_structures(position, structures) >= 0.0
 
 
-def _find_safe_fallback_position(bot, ideal_pos: Point2, gate_keep_pos: Point2, direction: Point2) -> Point2:
+def _find_parking_spot(bot, gate_pos: Point2, structures: list[Unit]) -> Point2 | None:
+    """Closest spot behind the gate where the zealot actually fits.
+
+    The old fallback aimed at one fixed offset towards our base, which on cramped
+    maps lands inside a building footprint - the engine shoves the zealot out and
+    the next frame orders it straight back into the same tile.
     """
-    Find a safe fallback position that doesn't block building placement.
-    Search order: ideal position -> perpendicular offsets -> further back.
+    base_target = bot.start_location if bot.enemy_race == Race.Protoss else bot.natural_expansion
+    inward = base_target - gate_pos
+    if inward.length == 0:
+        return None
+    inward = inward.normalized
+    lateral = Point2((-inward.y, inward.x))
+    best_spot: Point2 | None = None
+    best_gap = -math.inf
+
+    for distance in GATEKEEPER_PARK_DISTANCES:
+        for offset in GATEKEEPER_PARK_LATERAL_OFFSETS:
+            candidate = gate_pos + inward * distance + lateral * offset
+            if not _is_walkable(bot, candidate):
+                continue
+            gap = _clearance_to_structures(candidate, structures)
+            if gap >= GATEKEEPER_CLEARANCE_MARGIN:
+                return candidate
+            if gap > best_gap:
+                best_spot, best_gap = candidate, gap
+
+    # Nothing has real room: only park where the zealot still does not overlap a footprint.
+    if best_spot is not None and best_gap >= 0.0:
+        return best_spot
+    return None
+
+
+def _current_spot(gate: Unit) -> Point2:
+    """Where the gatekeeper is heading, or where it stands when it has no order."""
+    order_target = gate.order_target
+    if isinstance(order_target, Point2):
+        return order_target
+    return gate.position
+
+
+def _order_move(gate: Unit, target: Point2) -> None:
+    """Issue a move only when the zealot is not already on its way there.
+
+    Re-issuing the same order every frame fights the engine's push-out: the engine
+    moves the zealot off a freshly placed building and the next order pulls it back.
     """
-    if _is_position_clear(bot, ideal_pos) and not _has_pending_build_near(bot, ideal_pos):
-        return ideal_pos
-    
-    perpendicular = Point2((-direction.y, direction.x))
-    
-    for offset_multiplier in [1.5, -1.5, 2.5, -2.5]:
-        candidate = ideal_pos + (perpendicular * offset_multiplier)
-        if _is_position_clear(bot, candidate) and not _has_pending_build_near(bot, candidate):
-            return candidate
-    
-    for extra_distance in [1.0, 2.0]:
-        candidate = ideal_pos + (direction * extra_distance)
-        if _is_position_clear(bot, candidate) and not _has_pending_build_near(bot, candidate):
-            return candidate
-    
-    return ideal_pos
+    order_target = gate.order_target
+    if isinstance(order_target, Point2) and cy_distance_to(order_target, target) <= GATEKEEPER_ORDER_TOLERANCE:
+        return
+    gate.move(target)
+
+
+def _is_holding_position(gate: Unit) -> bool:
+    orders = gate.orders
+    return bool(orders) and orders[0].ability.id == AbilityId.HOLDPOSITION
+
+
+def _park_off_the_gate(bot, gate: Unit, gate_pos: Point2, structures: list[Unit]) -> None:
+    """Keep the gap clear so a probe can build where the gatekeeper rests.
+
+    The parking spot is only re-picked when the current one stops being usable (a
+    building landed on it), otherwise the zealot shuffles back and forth.
+    """
+    if _parking_spot_is_free(bot, _current_spot(gate), gate_pos, structures):
+        return
+
+    spot = _find_parking_spot(bot, gate_pos, structures)
+    if spot is None:
+        status = "none"
+    elif _clearance_to_structures(spot, structures) < GATEKEEPER_CLEARANCE_MARGIN:
+        status = "tight"
+    else:
+        status = "ok"
+
+    log_transition(
+        subsystem="combat",
+        action="gatekeeper_parking",
+        reason="no footprint-free spot behind the gate" if status == "none" else "parking spot has no room to spare",
+        key="gatekeeper_parking_status",
+        value=status,
+    )
+
+    if spot is None:
+        # Nothing fits next to the gate: stay where the engine put us rather than
+        # ordering into a tile that overlaps a building.
+        return
+    _order_move(gate, spot)
+
+
+def _hold_the_gate(bot, gate: Unit, gate_pos: Point2, structures: list[Unit]) -> None:
+    """Stand on the gap and hold it while enemies are close."""
+    if _clearance_to_structures(gate_pos, structures) < 0.0:
+        # The gap is plugged by a building - there is no tile to hold.
+        _park_off_the_gate(bot, gate, gate_pos, structures)
+        return
+    if cy_distance_to(gate.position, gate_pos) > GATEKEEPER_POSITION_TOLERANCE:
+        _order_move(gate, gate_pos)
+        return
+    if not _is_holding_position(gate):
+        gate(AbilityId.HOLDPOSITION)
 
 
 def gatekeeper_control(bot, gatekeeper: Units) -> None:
     gate_keep_pos = bot.gatekeeping_pos
+    if not gate_keep_pos:
+        return
+
     any_close = bot.mediator.get_units_in_range(
         start_points=[gate_keep_pos],
         distances=GATEKEEPER_DETECTION_RANGE,
         query_tree=UnitTreeQueryType.EnemyGround,
         return_as_dict=False,
     )[0]
-    
-    if not gate_keep_pos:
-        return
-    
+    structures = _gatekeeper_structures(bot, gate_keep_pos)
+
     for gate in gatekeeper:
-        dist_to_gate: float = cy_distance_to_squared(gate.position, gate_keep_pos)
         if any_close:
-            if dist_to_gate != 0:
-                gate.move(gate_keep_pos)
-                gate(AbilityId.HOLDPOSITION, queue=True)
-            else:
-                gate(AbilityId.HOLDPOSITION)
+            _hold_the_gate(bot, gate, gate_keep_pos, structures)
         else:
-            # Determine fallback direction based on opponent race
-            # PvP (main ramp): fall back towards start location
-            # PvZ/Random (natural choke): fall back towards natural
-            if bot.enemy_race == Race.Protoss:
-                fallback_target = bot.start_location
-            else:
-                fallback_target = bot.natural_expansion
-            
-            direction = fallback_target - gate_keep_pos
-            if direction.length > 0:  # Avoid division by zero
-                direction = direction.normalized
-                ideal_fallback = gate_keep_pos + (direction * GATEKEEPER_MOVE_DISTANCE)
-                
-                # Find safe position that doesn't block building placement
-                safe_pos = _find_safe_fallback_position(bot, ideal_fallback, gate_keep_pos, direction)
-                gate.move(safe_pos)   
-            
+            _park_off_the_gate(bot, gate, gate_keep_pos, structures)
+
 
 def _is_valid_warp_in_position(bot, position: Point2, ground_grid: np.ndarray) -> bool:
     """

@@ -303,6 +303,30 @@ GATEKEEPER_DETECTION_RANGE = 6.0
 GATEKEEPER_MOVE_DISTANCE = 3.0
 """Distance gatekeeper moves when no enemies present"""
 
+GATEKEEPER_ZEALOT_RADIUS = 1.0
+"""Zealot collision radius - a parked zealot needs this much clear space around its tile"""
+
+GATEKEEPER_CLEARANCE_MARGIN = 0.3
+"""Preferred gap kept around structure footprints when parking, so the engine never shoves the zealot"""
+
+GATEKEEPER_PARK_DISTANCES = (2.5, GATEKEEPER_MOVE_DISTANCE, 3.5, 4.0, 4.5, 5.0)
+"""Distances behind the gate a parking spot may sit at, closest first"""
+
+GATEKEEPER_PARK_MIN_DISTANCE = GATEKEEPER_PARK_DISTANCES[0]
+"""Closest a parking spot may sit to the gate - clears a 2x2 building placed on the gap"""
+
+GATEKEEPER_PARK_LATERAL_OFFSETS = (0.0, -1.5, 1.5, -2.5, 2.5)
+"""Lateral (parallel to the wall) offsets tried next to the gate - straight behind first"""
+
+GATEKEEPER_CLEARANCE_SEARCH_RADIUS = 9.0
+"""Radius around the gate searched for structures that could crowd a parking spot"""
+
+GATEKEEPER_POSITION_TOLERANCE = 1.0
+"""Distance at which the gatekeeper counts as standing on the gate"""
+
+GATEKEEPER_ORDER_TOLERANCE = 0.75
+"""Distance under which a new move order counts as a duplicate of the current one"""
+
 # ===== WARP PRISM PARAMETERS =====
 WARP_PRISM_FOLLOW_DISTANCE = 15.0
 """Distance threshold for warp prism to morph to phasing mode"""
