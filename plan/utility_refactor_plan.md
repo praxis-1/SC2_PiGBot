@@ -10,6 +10,12 @@ priority: high
 
 # Utility AI Refactor Plan — PiG_Bot
 
+<!--
+Purpose: Convert PiG_Bot's threshold-based decisions to scored utility-AI across managers and combat targeting, coordinated through one intel picture.
+Key Decisions: Canonical score = (Σ base scores) × (Π multipliers), any veto ⇒ 0; curve steepness is the primary anti-oscillation tool with scored hysteresis as fallback — never sticky switches; beliefs enter as multipliers, not additive terms; magnitudes hand-seeded (Liquipedia provenance) and refit from telemetry in Task 8.
+Limitations: Phase 1 covers the three managers plus squad attack-targeting (Task 10); engagement/retreat, chrono, expansion, defender allocation, mass recall and per-unit micro remain Adoption Roadmap rows; fitted weights await Task 8's corpus fit.
+-->
+
 ## Goal
 
 Lay the utility-AI foundation for the whole bot — one shared reasoner over one intel picture — then convert the three managers as its first adopters. Every later decision system (combat, structures, expansion) joins the same currency instead of growing new thresholds.
@@ -228,7 +234,7 @@ u(scout) = info_gain(staleness × decision_impact) × P_survive − cost(worker-
 
 - Per-squad commitment margin for any thrash that survives the curves. Seeds hand-set now, fitted from telemetry later (Task 8's machinery applies when scheduled).
 - Reporting: the 12 `current_attack_target` consumers (telemetry `attack_target` field, debug overlay) read the computed `army_focus` — the strongest squad's target, reporting only, same field names (constraint 4). One new per-squad transition event (emission-on-change) is the gate instrument.
-- **Sequencing:** plugs in where `attack_target()` is called now, feeding `handle_attack_toggles` per-squad candidates; army-wide engage/retreat stays until its own task. May execute before Task 8 — its seeds are hand-set; the fit applies to it when Task 8 runs.
+- **Sequencing:** plugs in where `attack_target()` is called today, and both callers are named: `handle_attack_toggles` (bot.py) receives per-squad candidates; the observer lead (scouting.py:1093) consumes the computed `army_focus` as its lead anchor — it reads reporting state, it does not drive combat behavior. Army-wide engage/retreat stays until its own task. May execute before Task 8 — its seeds are hand-set; the fit applies to it when Task 8 runs.
 
 **Acceptance:**
 - [ ] unit tests pin every consideration's curve shape and the canonical combination before integration (unit)
@@ -244,7 +250,8 @@ Phase 1 proves the foundation on three managers. The remaining decision surfaces
 
 | # | System | Current mechanism | Phase | Gates |
 |---|--------|-------------------|-------|-------|
-| 1 | Combat engagement — `handle_attack_toggles` engage/retreat | combat-sim gate + sticky duration timers | 2 | unit + scenario || 2 | Chronoboost + Energy Recharge — target selection | first-match priority lists | 2 | roster |
+| 1 | Combat engagement — `handle_attack_toggles` engage/retreat | combat-sim gate + sticky duration timers | 2 | unit + scenario |
+| 2 | Chronoboost + Energy Recharge — target selection | first-match priority lists | 2 | roster |
 | 3 | Expansion — `_has_map_control` / `expansion_checker` | hard gates + threshold conjunctions | 2 | roster |
 | 4 | Defender allocation — threat response sizing | graduated severity table | 2 | unit + scenario |
 | 5 | Mass Recall — `try_mass_recall` gates | three AND-gates | 2 | unit + scenario, no roster |
