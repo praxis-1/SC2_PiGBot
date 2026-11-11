@@ -301,34 +301,37 @@ GATEKEEPER_DETECTION_RANGE = 6.0
 """Range to detect enemies around gatekeeping position"""
 
 GATEKEEPER_MOVE_DISTANCE = 3.0
-"""Distance gatekeeper moves when no enemies present"""
+"""Designed distance from the gap the gatekeeper rests at - back on the gap before a detected enemy arrives"""
 
 GATEKEEPER_ZEALOT_RADIUS = 1.0
-"""Zealot collision radius - a parked zealot needs this much clear space around its tile"""
+"""Zealot collision radius - a resting zealot needs this much clear space around its tile"""
 
 GATEKEEPER_CLEARANCE_MARGIN = 0.3
-"""Preferred gap kept around structure footprints when parking, so the engine never shoves the zealot"""
+"""Preferred gap kept around building footprints when resting, so the engine never shoves the zealot"""
 
-GATEKEEPER_PARK_DISTANCES = (2.5, GATEKEEPER_MOVE_DISTANCE)
-"""Distances behind the gate a parking spot may sit at, closest first"""
-
-GATEKEEPER_PARK_MIN_DISTANCE = GATEKEEPER_PARK_DISTANCES[0]
-"""Closest a parking spot may sit to the gate - clears a 2x2 building placed on the gap"""
+GATEKEEPER_PARK_MIN_DISTANCE = 2.5
+"""Closest a resting spot may sit to the gate - clears a 2x2 building placed on the gap"""
 
 GATEKEEPER_PARK_MAX_DISTANCE = GATEKEEPER_DETECTION_RANGE / 2
-"""Furthest the gatekeeper may park from the gap - half the detection range, so it is back in time"""
+"""Furthest the gatekeeper may rest from the gap - half the detection range, so it is back in time"""
 
-GATEKEEPER_PARK_LATERAL_OFFSETS = (0.0, -1.0, 1.0, -1.5, 1.5)
-"""Lateral (parallel to the wall) offsets tried next to the gate - straight behind first"""
+GATEKEEPER_PARK_RADII = (GATEKEEPER_PARK_MIN_DISTANCE, 2.75, GATEKEEPER_MOVE_DISTANCE)
+"""Distances from the gate a fallback resting spot may sit at, closest first"""
 
-GATEKEEPER_CLEARANCE_SEARCH_RADIUS = 9.0
-"""Radius around the gate searched for structures that could crowd a parking spot"""
+GATEKEEPER_PARK_ANGLES = (0.0, -0.25, 0.25, -0.5, 0.5, -0.75, 0.75)
+"""Angles from the towards-base axis tried for a fallback spot, straight behind first (radians)"""
 
-GATEKEEPER_POSITION_TOLERANCE = 1.0
-"""Distance at which the gatekeeper counts as standing on the gate"""
+GATEKEEPER_ARRIVAL_DISTANCE = 0.5
+"""Distance at which the gatekeeper counts as standing on the gate - its centre on the gap tile"""
 
 GATEKEEPER_ORDER_TOLERANCE = 0.75
 """Distance under which a new move order counts as a duplicate of the current one"""
+
+GATEKEEPER_CLEARANCE_SEARCH_RADIUS = 9.0
+"""Radius around the gate searched for structures that could crowd a resting spot"""
+
+GATEKEEPER_RESERVATION_RADIUS = 8.0
+"""Planned building positions this close to the gate are reserved - the probe will come to build them"""
 
 # ===== WARP PRISM PARAMETERS =====
 WARP_PRISM_FOLLOW_DISTANCE = 15.0

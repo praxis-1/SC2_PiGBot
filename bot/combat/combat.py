@@ -17,6 +17,7 @@ from ares.behaviors.combat.group import PathGroupToTarget
 from ares.managers.squad_manager import UnitSquad
 
 from ares.consts import UnitRole
+from ares.consts import BUILDING_SIZE_ENUM_TO_RADIUS
 
 from bot.managers.reactions import assess_threat
 from bot.constants import (
@@ -36,15 +37,17 @@ from bot.constants import (
     MAP_CROSSING_SUCCESS_DISTANCE,
     UNIT_ENEMY_DETECTION_RANGE,
     GATEKEEPER_DETECTION_RANGE,
+    GATEKEEPER_MOVE_DISTANCE,
     GATEKEEPER_ZEALOT_RADIUS,
     GATEKEEPER_CLEARANCE_MARGIN,
-    GATEKEEPER_PARK_DISTANCES,
     GATEKEEPER_PARK_MIN_DISTANCE,
     GATEKEEPER_PARK_MAX_DISTANCE,
-    GATEKEEPER_PARK_LATERAL_OFFSETS,
-    GATEKEEPER_CLEARANCE_SEARCH_RADIUS,
-    GATEKEEPER_POSITION_TOLERANCE,
+    GATEKEEPER_PARK_RADII,
+    GATEKEEPER_PARK_ANGLES,
+    GATEKEEPER_ARRIVAL_DISTANCE,
     GATEKEEPER_ORDER_TOLERANCE,
+    GATEKEEPER_CLEARANCE_SEARCH_RADIUS,
+    GATEKEEPER_RESERVATION_RADIUS,
     WARP_PRISM_FOLLOW_DISTANCE,
     WARP_PRISM_FOLLOW_OFFSET,
     WARP_PRISM_UNIT_CHECK_RANGE,
@@ -1362,28 +1365,54 @@ def control_main_army(bot, main_army: Units, target: Point2, squads: list[UnitSq
 
     return pos_of_main_squad
 
-def _gatekeeper_structures(bot, position: Point2) -> list[Unit]:
-    """Structures that could crowd a parking spot: our own (including the ones still
-    under construction) and the enemy's."""
-    return list(bot.structures.closer_than(GATEKEEPER_CLEARANCE_SEARCH_RADIUS, position)) + list(
-        bot.enemy_structures.closer_than(GATEKEEPER_CLEARANCE_SEARCH_RADIUS, position)
+def _planned_buildings_near_gate(bot, gate_pos: Point2) -> list[tuple[Point2, float]]:
+    """Planned building positions near the gate, with their footprint radius.
+
+    ARES parses protoss_building_placements.yml into placements_dict at game start -
+    every entry is a tile the probe will come to build, so the gatekeeper must never
+    rest on one. The gap itself is the GateKeeper entry and never lands in this dict,
+    so it stays standable. Placements are fixed per game, so this loads once.
+    """
+    reserved = getattr(bot, "_gatekeeper_reserved_buildings", None)
+    if reserved is not None:
+        return reserved
+
+    reserved = []
+    placements: dict = bot.mediator.get_placements_dict
+    for sizes in placements.values():
+        for size, positions in sizes.items():
+            radius: float = BUILDING_SIZE_ENUM_TO_RADIUS.get(size, 1.0)
+            for position in positions:
+                if cy_distance_to(position, gate_pos) <= GATEKEEPER_RESERVATION_RADIUS:
+                    reserved.append((position, radius))
+    bot._gatekeeper_reserved_buildings = reserved
+    return reserved
+
+
+def _gatekeeper_obstacles(bot, gate_pos: Point2) -> list[tuple[Point2, float]]:
+    """Everything a resting spot must keep clear of: built structures (own and enemy,
+    including ones still under construction) plus the planned buildings."""
+    structures = list(bot.structures.closer_than(GATEKEEPER_CLEARANCE_SEARCH_RADIUS, gate_pos)) + list(
+        bot.enemy_structures.closer_than(GATEKEEPER_CLEARANCE_SEARCH_RADIUS, gate_pos)
     )
+    obstacles = [
+        (structure.position, structure.footprint_radius or structure.radius or 0.0)
+        for structure in structures
+    ]
+    obstacles.extend(_planned_buildings_near_gate(bot, gate_pos))
+    return obstacles
 
 
-def _clearance_to_structures(position: Point2, structures: list[Unit]) -> float:
-    """Gap between a tile and the closest structure footprint.
+def _clearance_to_obstacles(position: Point2, obstacles: list[tuple[Point2, float]]) -> float:
+    """Gap between a tile and the closest building footprint.
 
     Negative means the tile overlaps a footprint. A zealot standing there is shoved
     by the engine, which is what turned the old fallback into a tug-of-war with the
     probe that was building.
     """
     gap: float = math.inf
-    for structure in structures:
-        footprint = structure.footprint_radius or structure.radius or 0.0
-        gap = min(
-            gap,
-            cy_distance_to(structure.position, position) - footprint - GATEKEEPER_ZEALOT_RADIUS,
-        )
+    for obstacle, footprint in obstacles:
+        gap = min(gap, cy_distance_to(obstacle, position) - footprint - GATEKEEPER_ZEALOT_RADIUS)
     return gap
 
 
@@ -1392,75 +1421,83 @@ def _is_walkable(bot, position: Point2) -> bool:
     return cy_in_pathing_grid_ma(bot.mediator.get_ground_grid, position)
 
 
-def _parking_spot_is_free(bot, position: Point2, gate_pos: Point2, structures: list[Unit]) -> bool:
-    """A spot is free when the zealot fits, the tile is walkable and the gap stays clear.
+def _is_in_resting_range(position: Point2, gate_pos: Point2, base_target: Point2) -> bool:
+    """Inside the reaction range, and on our side of the wall.
 
-    The gap itself never qualifies: a probe may be about to build there. The spot also
-    has to stay inside the reaction budget - parked too far back, the zealot is still
-    walking towards the gap when a detected enemy arrives - and keep the same comfort
-    margin the spot was picked with, so a tight tile gets traded for a roomier one.
+    A spot as far from the base as the gate is faces the enemy - resting there opens
+    the choke and the zealot may not make it back in time.
     """
     distance_to_gate = cy_distance_to(position, gate_pos)
-    if distance_to_gate < GATEKEEPER_PARK_MIN_DISTANCE:
+    if distance_to_gate < GATEKEEPER_PARK_MIN_DISTANCE or distance_to_gate > GATEKEEPER_PARK_MAX_DISTANCE:
         return False
-    if distance_to_gate > GATEKEEPER_PARK_MAX_DISTANCE:
+    return cy_distance_to(position, base_target) < cy_distance_to(gate_pos, base_target)
+
+
+def _resting_spot_is_clear(
+    bot, position: Point2, gate_pos: Point2, base_target: Point2, obstacles: list[tuple[Point2, float]]
+) -> bool:
+    """A resting spot must stay inside the reaction range, on our side of the wall,
+    on walkable ground, and clear of every built or planned building footprint."""
+    if not _is_in_resting_range(position, gate_pos, base_target):
         return False
     if not _is_walkable(bot, position):
         return False
-    return _clearance_to_structures(position, structures) >= GATEKEEPER_CLEARANCE_MARGIN
+    return _clearance_to_obstacles(position, obstacles) >= GATEKEEPER_CLEARANCE_MARGIN
 
 
-def _find_parking_spot(bot, gate_pos: Point2, structures: list[Unit]) -> Point2 | None:
-    """Closest spot behind the gate where the zealot actually fits.
+def _find_resting_spot(
+    bot, gate_pos: Point2, base_target: Point2, obstacles: list[tuple[Point2, float]]
+) -> Point2 | None:
+    """The designed resting spot, or the closest clear one to the gate.
 
-    The old fallback aimed at one fixed offset towards our base, which on cramped
-    maps lands inside a building footprint - the engine shoves the zealot out and
-    the next frame orders it straight back into the same tile.
+    The designed spot sits GATEKEEPER_MOVE_DISTANCE towards the base - close enough
+    to be back on the gap before a detected enemy arrives. When a planned or built
+    building sits on it, fall back to the clear spot closest to the gate: that is
+    always on the gap side of whatever is in the way. Candidates are tried distance
+    from the gate first, then closeness to the towards-base axis - both tiers in the
+    same deterministic order.
     """
-    base_target = bot.start_location if bot.enemy_race == Race.Protoss else bot.natural_expansion
     inward = base_target - gate_pos
     if inward.length == 0:
         return None
     inward = inward.normalized
-    lateral = Point2((-inward.y, inward.x))
-    best_spot: Point2 | None = None
-    best_gap = -math.inf
 
-    for distance in GATEKEEPER_PARK_DISTANCES:
-        for offset in GATEKEEPER_PARK_LATERAL_OFFSETS:
-            candidate = gate_pos + inward * distance + lateral * offset
-            # Stay inside the reaction budget: the gatekeeper has to be back on the
-            # gap before a detected enemy reaches it.
-            if cy_distance_to(candidate, gate_pos) > GATEKEEPER_PARK_MAX_DISTANCE:
-                continue
-            if not _is_walkable(bot, candidate):
-                continue
-            gap = _clearance_to_structures(candidate, structures)
-            if gap >= GATEKEEPER_CLEARANCE_MARGIN:
-                return candidate
-            if gap > best_gap:
-                best_spot, best_gap = candidate, gap
+    anchor = gate_pos + inward * GATEKEEPER_MOVE_DISTANCE
+    if _resting_spot_is_clear(bot, anchor, gate_pos, base_target, obstacles):
+        return anchor
 
-    # Nothing has real room: only park where the zealot still does not overlap a footprint.
-    if best_spot is not None and best_gap >= 0.0:
-        return best_spot
+    candidates: list[Point2] = []
+    for radius in GATEKEEPER_PARK_RADII:
+        for angle in GATEKEEPER_PARK_ANGLES:
+            direction = Point2((
+                inward.x * math.cos(angle) - inward.y * math.sin(angle),
+                inward.x * math.sin(angle) + inward.y * math.cos(angle),
+            ))
+            candidates.append(gate_pos + direction * radius)
+
+    for candidate in candidates:
+        if _resting_spot_is_clear(bot, candidate, gate_pos, base_target, obstacles):
+            return candidate
+    for candidate in candidates:
+        # Nothing has the comfort margin: take the closest spot where the zealot at
+        # least does not overlap a footprint, so the engine has nothing to shove.
+        if (
+            _is_in_resting_range(candidate, gate_pos, base_target)
+            and _is_walkable(bot, candidate)
+            and _clearance_to_obstacles(candidate, obstacles) >= 0.0
+        ):
+            return candidate
     return None
 
 
-def _current_spot(gate: Unit) -> Point2:
-    """Where the gatekeeper is heading, or where it stands when it has no order."""
-    order_target = gate.order_target
-    if isinstance(order_target, Point2):
-        return order_target
-    return gate.position
-
-
 def _order_move(gate: Unit, target: Point2) -> None:
-    """Issue a move only when the zealot is not already on its way there.
+    """Issue a move only when the zealot is not already there or on its way.
 
-    Re-issuing the same order every frame fights the engine's push-out: the engine
-    moves the zealot off a freshly placed building and the next order pulls it back.
+    Re-issuing the same order every frame re-asserts the tile under the zealot's
+    feet - that is what made it fight the probe for the build spot.
     """
+    if cy_distance_to(gate.position, target) <= GATEKEEPER_ORDER_TOLERANCE:
+        return
     order_target = gate.order_target
     if isinstance(order_target, Point2) and cy_distance_to(order_target, target) <= GATEKEEPER_ORDER_TOLERANCE:
         return
@@ -1472,48 +1509,46 @@ def _is_holding_position(gate: Unit) -> bool:
     return bool(orders) and orders[0].ability.id == AbilityId.HOLDPOSITION
 
 
-def _park_off_the_gate(bot, gate: Unit, gate_pos: Point2, structures: list[Unit]) -> None:
-    """Keep the gap clear so a probe can build where the gatekeeper rests.
+def _park_off_the_gate(bot, gate: Unit, gate_pos: Point2, base_target: Point2) -> None:
+    """Rest off the gap so a probe can build where the gatekeeper stands.
 
-    The parking spot is only re-picked when the current one stops being usable (a
-    building landed on it), otherwise the zealot shuffles back and forth.
+    The spot is recomputed each frame but only re-ordered when it changes, so a
+    resting zealot issues no orders at all - the probe finds a free tile beside a
+    stationary zealot instead of fighting it for one.
     """
-    if _parking_spot_is_free(bot, _current_spot(gate), gate_pos, structures):
-        return
-
-    spot = _find_parking_spot(bot, gate_pos, structures)
-    if spot is None:
-        status = "none"
-    elif _clearance_to_structures(spot, structures) < GATEKEEPER_CLEARANCE_MARGIN:
-        status = "tight"
-    else:
-        status = "ok"
-
-    log_transition(
-        subsystem="combat",
-        action="gatekeeper_parking",
-        reason="no footprint-free spot behind the gate" if status == "none" else "parking spot has no room to spare",
-        key="gatekeeper_parking_status",
-        value=status,
-    )
+    obstacles = _gatekeeper_obstacles(bot, gate_pos)
+    spot = _find_resting_spot(bot, gate_pos, base_target, obstacles)
 
     if spot is None:
-        # Nothing fits next to the gate: hold where we are so the engine's push-out
-        # settles the zealot. Leaving the old move order live walks it straight back
-        # into the building - the tug-of-war this fallback exists to avoid.
+        log_transition(
+            subsystem="combat",
+            action="gatekeeper_parking",
+            reason="no clear resting spot inside the reaction range",
+            key="gatekeeper_parking_status",
+            value="none",
+        )
+        # Nothing clear within the reaction range: hold where we are instead of
+        # fighting the probe or the engine for a tile.
         if not _is_holding_position(gate):
             gate(AbilityId.HOLDPOSITION)
         return
+
+    status = "ok" if _clearance_to_obstacles(spot, obstacles) >= GATEKEEPER_CLEARANCE_MARGIN else "tight"
+    log_transition(
+        subsystem="combat",
+        action="gatekeeper_parking",
+        reason="resting spot has no room to spare" if status == "tight" else "resting spot found",
+        key="gatekeeper_parking_status",
+        value=status,
+    )
     _order_move(gate, spot)
 
 
-def _hold_the_gate(bot, gate: Unit, gate_pos: Point2, structures: list[Unit]) -> None:
+def _hold_the_gate(gate: Unit, gate_pos: Point2) -> None:
     """Stand on the gap and hold it while enemies are close."""
-    if _clearance_to_structures(gate_pos, structures) < 0.0:
-        # The gap is plugged by a building - there is no tile to hold.
-        _park_off_the_gate(bot, gate, gate_pos, structures)
-        return
-    if cy_distance_to(gate.position, gate_pos) > GATEKEEPER_POSITION_TOLERANCE:
+    if cy_distance_to(gate.position, gate_pos) > GATEKEEPER_ARRIVAL_DISTANCE:
+        # Keep the move order alive until the zealot is on the gap tile: a hold
+        # issued on the way cancels the walk in and leaves the gate open.
         _order_move(gate, gate_pos)
         return
     if not _is_holding_position(gate):
@@ -1531,13 +1566,16 @@ def gatekeeper_control(bot, gatekeeper: Units) -> None:
         query_tree=UnitTreeQueryType.EnemyGround,
         return_as_dict=False,
     )[0]
-    structures = _gatekeeper_structures(bot, gate_keep_pos)
+
+    # PvP (main ramp): rest towards start location
+    # PvZ/Random (natural choke): rest towards natural
+    base_target = bot.start_location if bot.enemy_race == Race.Protoss else bot.natural_expansion
 
     for gate in gatekeeper:
         if any_close:
-            _hold_the_gate(bot, gate, gate_keep_pos, structures)
+            _hold_the_gate(gate, gate_keep_pos)
         else:
-            _park_off_the_gate(bot, gate, gate_keep_pos, structures)
+            _park_off_the_gate(bot, gate, gate_keep_pos, base_target)
 
 
 def _is_valid_warp_in_position(bot, position: Point2, ground_grid: np.ndarray) -> bool:
