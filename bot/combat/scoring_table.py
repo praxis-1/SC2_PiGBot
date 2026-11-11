@@ -191,6 +191,7 @@ SCORING_TABLE: dict[tuple[UnitTypeId, UnitTypeId], float] = {
     (UnitTypeId.STALKER, UnitTypeId.VOIDRAY):         8.0,  # Anti-air
     (UnitTypeId.STALKER, UnitTypeId.MEDIVAC):         8.0,  # Anti-air, removes healing
     (UnitTypeId.STALKER, UnitTypeId.BANSHEE):         8.0,  # Anti-air
+    (UnitTypeId.STALKER, UnitTypeId.RAVEN):           8.0,  # Anti-air; killing it stops its Anti-Armor Missile shredding our armor
     (UnitTypeId.STALKER, UnitTypeId.MUTALISK):        8.0,  # Anti-air, Blink helps chase
     (UnitTypeId.STALKER, UnitTypeId.WARPPRISM):      10.0,  # Anti-air, high-value snipe
     (UnitTypeId.STALKER, UnitTypeId.LIBERATOR):        8.0,  # Anti-air, Blink past defender zones
@@ -333,6 +334,7 @@ SCORING_TABLE: dict[tuple[UnitTypeId, UnitTypeId], float] = {
     # Feedback targets (LP: "Dealing pure damage, ignores all types of armor"; the Sentry/Phoenix/Oracle are all susceptible)
     (UnitTypeId.HIGHTEMPLAR, UnitTypeId.PHOENIX):    8.0,  # LP: "High Templars can also be used to Feedback Phoenixes and Oracles"
     (UnitTypeId.HIGHTEMPLAR, UnitTypeId.ORACLE):     8.0,  # LP: the Oracle is susceptible to Feedback
+    (UnitTypeId.HIGHTEMPLAR, UnitTypeId.RAVEN):      8.0,  # LP: the Raven is susceptible to Feedback — drains the energy behind every ability
     (UnitTypeId.HIGHTEMPLAR, UnitTypeId.SENTRY):     6.0,  # LP: the Sentry is susceptible to Feedback
     # PvP mirror target (enemy Protoss units we can face)
     (UnitTypeId.HIGHTEMPLAR, UnitTypeId.COLOSSUS):  -6.0,  # LP (in-game help): High Templar is weak vs Colossus
@@ -354,10 +356,12 @@ SCORING_TABLE: dict[tuple[UnitTypeId, UnitTypeId], float] = {
     (UnitTypeId.DARKTEMPLAR, UnitTypeId.MARINE): 5.0,  # 45-dmg melee shreds light if no detection
     # NOTE: detection-dependent; worker-line value not modeled in this table (workers excluded)
     (UnitTypeId.DARKTEMPLAR, UnitTypeId.DISRUPTOR): -8.0,  # LP: Nova "can kill the following units with one shot:... Dark Templars"
+    (UnitTypeId.DARKTEMPLAR, UnitTypeId.RAVEN):     -6.0,  # LP: DT "Weak against: Observer, Raven, Overseer" — the Raven's mobile Detection reveals it
 
     # Phoenix: air superiority + Graviton Beam vs light/casters (LP: "effective at disabling caster units or destroying them outright. Most casters have light armor")
     (UnitTypeId.PHOENIX, UnitTypeId.MUTALISK):       8.0,  # Classic Muta counter
     (UnitTypeId.PHOENIX, UnitTypeId.BANSHEE):        6.0,  # Light air, melts
+    (UnitTypeId.PHOENIX, UnitTypeId.RAVEN):          6.0,  # LP: Raven "Weak against: Phoenix" — light air, melts
     (UnitTypeId.PHOENIX, UnitTypeId.MEDIVAC):        6.0,  # Lifts/heal-kill
     (UnitTypeId.PHOENIX, UnitTypeId.VIPER):          6.0,  # Air, disables
     (UnitTypeId.PHOENIX, UnitTypeId.ORACLE):         5.0,  # Mirror: out-fights caster
@@ -371,6 +375,7 @@ SCORING_TABLE: dict[tuple[UnitTypeId, UnitTypeId], float] = {
     (UnitTypeId.VOIDRAY, UnitTypeId.TEMPEST):        8.0,  # LP: "extremely strong against Tempest (bonus damage against armored)"
     (UnitTypeId.VOIDRAY, UnitTypeId.CARRIER):        6.0,  # LP: Carriers "easily countered by Stalkers + Sentries, Tempests, and Void Rays"
     (UnitTypeId.VOIDRAY, UnitTypeId.MEDIVAC):        5.0,  # LP: drop deterrent — "a boosted Medivac... will barely get through"
+    (UnitTypeId.VOIDRAY, UnitTypeId.RAVEN):          5.0,  # Support air; it has no real weapon to answer a Void Ray
     (UnitTypeId.VOIDRAY, UnitTypeId.MARINE):        -6.0,  # Mass small arms
     (UnitTypeId.VOIDRAY, UnitTypeId.STALKER):       -8.0,  # LP: "Stalkers can deal with Void Rays easily because of the ease of making large amounts"
     (UnitTypeId.VOIDRAY, UnitTypeId.HYDRALISK):     -6.0,  # Mass ranged

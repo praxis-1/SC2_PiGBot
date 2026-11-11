@@ -320,6 +320,31 @@ def test_state_variant_rows_exist() -> None:
     assert not wrong, f"rows missing or changed: {wrong}"
 
 
+def test_raven_rows_exist() -> None:
+    """Pin the Raven rows — the Terran support unit the table had no answer for.
+
+    LP (LotV): the Raven is a 140-HP Detector with no real weapon, so every
+    Protoss anti-air out-trades it. What it does carry is Detection (sees
+    cloaked/burrowed units) and Anti-Armor Missile (armor and Protoss shield
+    armor shred), which is why the Stalker row exists and why a Dark Templar
+    must not rely on staying cloaked.
+    """
+    expected = {
+        (UnitTypeId.STALKER, UnitTypeId.RAVEN): 8.0,
+        (UnitTypeId.HIGHTEMPLAR, UnitTypeId.RAVEN): 8.0,
+        (UnitTypeId.PHOENIX, UnitTypeId.RAVEN): 6.0,
+        (UnitTypeId.VOIDRAY, UnitTypeId.RAVEN): 5.0,
+        (UnitTypeId.DARKTEMPLAR, UnitTypeId.RAVEN): -6.0,
+    }
+    wrong = {
+        key: (value, SCORING_TABLE.get(key))
+        for key, value in expected.items()
+        if SCORING_TABLE.get(key) != value
+    }
+    assert not wrong, f"rows missing or changed: {wrong}"
+    assert TACTICAL_BONUS.get(UnitTypeId.RAVEN) is not None, "Raven has no tactical bonus"
+
+
 def test_belief_layer_names_the_lurker_the_table_knows() -> None:
     """The belief layer and the scoring table must speak the same lurker id.
 
