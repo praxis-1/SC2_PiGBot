@@ -35,7 +35,7 @@ from ares.dicts.cost_dict import COST_DICT
 from ares.dicts.unit_data import UNIT_DATA
 from ares.dicts.unit_tech_requirement import UNIT_TECH_REQUIREMENT
 
-from bot.combat.scoring_table import SCORING_TABLE, SITUATIONAL_ROWS
+from bot.combat.scoring_table import SITUATIONAL_ROWS, resolve_scoring_row
 from bot.constants import (
     PRODUCTION_MIN_PROPORTION,
     STRATEGY_EXPECTED_UNITS,
@@ -298,10 +298,12 @@ def counter_effectiveness(
             enemy_type = _unit_by_name(enemy_name)
             if enemy_type is None:
                 continue
-            row = (unit_type, enemy_type)
+            # resolve_scoring_row folds a state variant (burrowed Roach) onto
+            # the row of the unit it is — the belief layer speaks raw game ids.
+            row, value = resolve_scoring_row(unit_type, enemy_type)
             if row in SITUATIONAL_ROWS:
                 continue
-            unit_value += float(share) * SCORING_TABLE.get(row, 0.0)
+            unit_value += float(share) * value
         total += proportion * unit_value
     return total
 

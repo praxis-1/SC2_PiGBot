@@ -1,7 +1,9 @@
 """Format + coverage validation for SCORING_TABLE (bot/combat/scoring_table.py).
 
 Purpose: pin the table's invariants so a bad row cannot slip in unnoticed —
-    duplicate pairs, keys that do not resolve, off-scale values, coverage holes.
+    duplicate pairs, keys that do not resolve, off-scale values, coverage holes,
+    and the state-variant normalization that keeps a burrowed Roach scoring
+    like the Roach row.
 Key Decisions: the table is inspected directly — no game, no SC2 binary. The
     duplicate check parses the source with `ast`: a Python dict keeps only the
     last value for a repeated key, so the runtime table cannot show duplicates.
@@ -17,7 +19,21 @@ from pathlib import Path
 
 from sc2.ids.unit_typeid import UnitTypeId
 
-from bot.combat.scoring_table import SCORING_TABLE, SITUATIONAL_ROWS
+from bot.combat.scoring_table import (
+    BASE_UNIT_TYPE,
+    SCORING_TABLE,
+    SITUATIONAL_ROWS,
+    TACTICAL_BONUS,
+    base_unit_type,
+    resolve_scoring_row,
+    tactical_bonus,
+)
+from bot.constants import (
+    STRATEGY_EXPECTED_UNITS,
+    STRUCTURE_SEEN_UNIT_PRIOR,
+    Race,
+    StrategyCategory,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TABLE_SOURCE = REPO_ROOT / "bot" / "combat" / "scoring_table.py"
@@ -196,3 +212,123 @@ def test_excluded_units_have_no_attacker_rows() -> None:
     excluded = {UnitTypeId.OBSERVER, UnitTypeId.ORACLE, UnitTypeId.MOTHERSHIP}
     attackers = {our_type for our_type, _ in SCORING_TABLE}
     assert not (attackers & excluded), f"excluded units used as attackers: {attackers & excluded}"
+
+
+# ===== STATE-VARIANT NORMALIZATION =====
+
+STATE_COPY_PAIRS = (
+    (UnitTypeId.SIEGETANK, UnitTypeId.SIEGETANKSIEGED),
+    (UnitTypeId.LURKERMP, UnitTypeId.LURKERMPBURROWED),
+    (UnitTypeId.LIBERATOR, UnitTypeId.LIBERATORAG),
+    (UnitTypeId.GHOST, UnitTypeId.GHOSTNOVA),
+)
+"""(base id, state id) pairs whose tactical bonus must not differ."""
+
+
+def test_burrowed_roach_scores_like_the_roach_row() -> None:
+    """A burrowed Roach must not fall through the table to zero.
+
+    The game reports ROACHBURROWED, the table knows ROACH. Without the
+    normalizer the burrowed Roach scored as an unknown unit.
+    """
+    row, value = resolve_scoring_row(UnitTypeId.IMMORTAL, UnitTypeId.ROACHBURROWED)
+    assert row == (UnitTypeId.IMMORTAL, UnitTypeId.ROACH)
+    assert value == SCORING_TABLE[(UnitTypeId.IMMORTAL, UnitTypeId.ROACH)]
+
+
+def test_state_specific_rows_win_over_the_base_row() -> None:
+    """A state-specific row keeps its meaning — a sieged Tank is not a mobile Tank."""
+    row, value = resolve_scoring_row(UnitTypeId.IMMORTAL, UnitTypeId.SIEGETANKSIEGED)
+    assert row == (UnitTypeId.IMMORTAL, UnitTypeId.SIEGETANKSIEGED)
+    assert value == SCORING_TABLE[(UnitTypeId.IMMORTAL, UnitTypeId.SIEGETANKSIEGED)]
+
+
+def test_base_unit_type_maps_the_state_ids_the_game_reports() -> None:
+    """The normalizer must know the state ids that showed up in real games."""
+    for variant, base in (
+        (UnitTypeId.ROACHBURROWED, UnitTypeId.ROACH),
+        (UnitTypeId.ZERGLINGBURROWED, UnitTypeId.ZERGLING),
+        (UnitTypeId.LURKERMPBURROWED, UnitTypeId.LURKERMP),
+        (UnitTypeId.VIKINGASSAULT, UnitTypeId.VIKINGFIGHTER),
+        (UnitTypeId.THORAP, UnitTypeId.THOR),
+        (UnitTypeId.SIEGETANKSIEGED, UnitTypeId.SIEGETANK),
+        (UnitTypeId.GHOSTNOVA, UnitTypeId.GHOST),
+    ):
+        assert base_unit_type(variant) == base
+
+
+def test_every_state_variant_of_a_scored_unit_stays_reachable() -> None:
+    """No unit may become invisible to the table just because it changed state.
+
+    A burrowed Roach used to score zero against every Protoss unit — the
+    table had the ROACH row, but the game reports ROACHBURROWED.
+    """
+    unreachable = []
+    for (our_type, enemy_type) in SCORING_TABLE:
+        for variant, base in BASE_UNIT_TYPE.items():
+            if base != enemy_type:
+                continue
+            _, value = resolve_scoring_row(our_type, variant)
+            if value == 0.0:
+                unreachable.append((our_type.name, variant.name))
+    assert not unreachable, f"units unreachable in a state variant: {unreachable}"
+
+
+def test_tactical_bonus_follows_the_unit_not_its_state() -> None:
+    """A unit keeps its bonus in every state the game can report it in."""
+    for base, variant in STATE_COPY_PAIRS:
+        assert TACTICAL_BONUS.get(base) == TACTICAL_BONUS.get(variant), (
+            f"tactical bonus differs between {base.name} and {variant.name}"
+        )
+        assert tactical_bonus(variant) == tactical_bonus(base)
+
+
+def test_state_variant_rows_exist() -> None:
+    """Pin the rows the state-variant fix added — a cleanup must not drop them."""
+    expected = {
+        (UnitTypeId.IMMORTAL, UnitTypeId.LURKERMP): 10.0,
+        (UnitTypeId.DISRUPTOR, UnitTypeId.LURKERMP): 8.0,
+        (UnitTypeId.STALKER, UnitTypeId.LURKERMP): -6.0,
+        (UnitTypeId.ZEALOT, UnitTypeId.QUEEN): 6.0,
+        (UnitTypeId.ARCHON, UnitTypeId.QUEEN): 8.0,
+        (UnitTypeId.DISRUPTOR, UnitTypeId.QUEEN): 6.0,
+        (UnitTypeId.STALKER, UnitTypeId.REAPER): 6.0,
+        (UnitTypeId.DISRUPTOR, UnitTypeId.REAPER): 8.0,
+        (UnitTypeId.STALKER, UnitTypeId.CYCLONE): -6.0,
+        (UnitTypeId.DISRUPTOR, UnitTypeId.CYCLONE): 6.0,
+        (UnitTypeId.STALKER, UnitTypeId.WIDOWMINE): 6.0,
+        (UnitTypeId.STALKER, UnitTypeId.WIDOWMINEBURROWED): 6.0,
+        (UnitTypeId.DISRUPTOR, UnitTypeId.WIDOWMINE): 8.0,
+        (UnitTypeId.DISRUPTOR, UnitTypeId.WIDOWMINEBURROWED): 8.0,
+        (UnitTypeId.ZEALOT, UnitTypeId.HELLION): -6.0,
+        (UnitTypeId.ZEALOT, UnitTypeId.HELLIONTANK): -6.0,
+        (UnitTypeId.COLOSSUS, UnitTypeId.HELLION): 6.0,
+        (UnitTypeId.COLOSSUS, UnitTypeId.HELLIONTANK): 6.0,
+        (UnitTypeId.DISRUPTOR, UnitTypeId.HELLION): 8.0,
+        (UnitTypeId.DISRUPTOR, UnitTypeId.HELLIONTANK): 8.0,
+        (UnitTypeId.HIGHTEMPLAR, UnitTypeId.INFESTOR): 10.0,
+        (UnitTypeId.DISRUPTOR, UnitTypeId.INFESTOR): 8.0,
+        (UnitTypeId.STALKER, UnitTypeId.SWARMHOSTMP): -6.0,
+        (UnitTypeId.ARCHON, UnitTypeId.SWARMHOSTMP): 6.0,
+        (UnitTypeId.DISRUPTOR, UnitTypeId.SWARMHOSTMP): 6.0,
+    }
+    wrong = {
+        key: (value, SCORING_TABLE.get(key))
+        for key, value in expected.items()
+        if SCORING_TABLE.get(key) != value
+    }
+    assert not wrong, f"rows missing or changed: {wrong}"
+
+
+def test_belief_layer_names_the_lurker_the_table_knows() -> None:
+    """The belief layer and the scoring table must speak the same lurker id.
+
+    The strategy belief predicted LURKERMPBURROWED while the table is keyed on
+    LURKERMP, so the predicted share never reached a row.
+    """
+    expected = STRATEGY_EXPECTED_UNITS[(StrategyCategory.MACRO, Race.Zerg)]
+    assert UnitTypeId.LURKERMP in expected
+    assert UnitTypeId.LURKERMPBURROWED not in expected
+    assert STRUCTURE_SEEN_UNIT_PRIOR[UnitTypeId.HYDRALISKDEN][UnitTypeId.LURKERMP] > 0.0
+    assert any(enemy == UnitTypeId.LURKERMP for _, enemy in SCORING_TABLE)
+

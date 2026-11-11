@@ -37,7 +37,12 @@ from cython_extensions import (
 )
 from cython_extensions.numpy_helper import cy_all_points_below_max_value, cy_point_below_value
 
-from bot.combat.scoring_table import TACTICAL_BONUS, TYPE_VALUE_SCALE, DEFAULT_TYPE_VALUE
+from bot.combat.scoring_table import (
+    DEFAULT_TYPE_VALUE,
+    TYPE_VALUE_SCALE,
+    base_unit_type,
+    tactical_bonus,
+)
 from ares.consts import EngagementResult
 
 from bot.constants import (
@@ -81,13 +86,16 @@ def effective_value(target: Unit) -> float:
     """Compute the effective tactical value of an enemy unit.
 
     Combines ARES army_value (economic) with TACTICAL_BONUS (gameplay impact).
-    Same formula used in score_target() for consistency.
+    Same formula used in score_target() for consistency. A state variant
+    (burrowed Roach, Ghost in nova mode) resolves to its base unit.
 
     Perf: ~200ns (dict lookups only, no iteration).
     """
     data = UNIT_DATA.get(target.type_id)
+    if data is None:
+        data = UNIT_DATA.get(base_unit_type(target.type_id))
     base = (data["army_value"] * TYPE_VALUE_SCALE) if data else DEFAULT_TYPE_VALUE
-    return base + TACTICAL_BONUS.get(target.type_id, 0.0)
+    return base + tactical_bonus(target.type_id)
 
 
 def damage_per_volley(stalker: Unit, target: Unit) -> float:

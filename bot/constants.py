@@ -673,6 +673,9 @@ commitment semantics call that macro pressure (agreement-validated: 41-45%
 exact / 62-68% aggression agreement vs 8-23% unconditioned, n=483)."""
 
 # ===== STRATEGY-AWARE COMPOSITION SCORING =====
+# Unit ids are BASE ids (LURKERMP, not LURKERMPBURROWED): the scoring table is
+# keyed on base ids and the lookup folds a state variant onto them, so a
+# predicted share has to name the unit the table knows.
 STRATEGY_EXPECTED_UNITS: dict[tuple[StrategyCategory, Race], dict[UnitTypeId, float]] = {
     # Zerg cheese: 12-pool, proxy hatch spine — lings + drones + queen
     (StrategyCategory.CHEESE, Race.Zerg): {
@@ -702,7 +705,7 @@ STRATEGY_EXPECTED_UNITS: dict[tuple[StrategyCategory, Race], dict[UnitTypeId, fl
         UnitTypeId.ROACH: 0.25,
         UnitTypeId.HYDRALISK: 0.20,
         UnitTypeId.ZERGLING: 0.15,
-        UnitTypeId.LURKERMPBURROWED: 0.10,
+        UnitTypeId.LURKERMP: 0.10,
         UnitTypeId.DRONE: 0.20,
         UnitTypeId.QUEEN: 0.08,
         UnitTypeId.SPINECRAWLER: 0.02,

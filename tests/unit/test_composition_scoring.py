@@ -148,6 +148,15 @@ def test_counter_effectiveness_excludes_situational_rows() -> None:
     assert counter_effectiveness(composition, {"ZERGLING": 1.0}) == pytest.approx(0.0)
 
 
+def test_counter_effectiveness_resolves_state_variant_enemy_names() -> None:
+    """The belief layer speaks raw game ids — a burrowed Roach must still count."""
+    composition = _composition((UnitTypeId.IMMORTAL, 1.0))
+    shares = {"ROACHBURROWED": 1.0}
+    assert counter_effectiveness(composition, shares) == pytest.approx(
+        SCORING_TABLE[(UnitTypeId.IMMORTAL, UnitTypeId.ROACH)]
+    )
+
+
 def test_counter_effectiveness_without_intel_is_zero() -> None:
     """No enemy picture → no counter claim. The term stays silent, not negative."""
     composition = _composition((UnitTypeId.IMMORTAL, 1.0))

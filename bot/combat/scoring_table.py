@@ -6,12 +6,15 @@ Purpose: Elevate the matchup table from a production nudge to the bot's scoring 
 Key Decisions: Layered scoring (distance + health + type value + range + counter matchup + threat),
     uses Cython extensions for all heavy math, returns best target per unit;
     SCORING_TABLE covers the full Protoss combat arsenal (Oracle/Mothership excluded by design),
-    pairs + scores sourced from plan/counter_table_research_liquipedia.md (Liquipedia LotV pages)
+    pairs + scores sourced from plan/counter_table_research_liquipedia.md (Liquipedia LotV pages);
+    state variants (burrowed Roach, sieged Tank, assault-mode Viking) resolve to their base
+    unit unless the table has a state-specific row for them.
 Limitations: O(n*m) where n=own units, m=enemies in radius; mitigated by pre-filtering with cy_closer_than
 """
 
 from typing import Union
 
+from sc2.dicts.unit_unit_alias import UNIT_UNIT_ALIAS
 from sc2.ids.unit_typeid import UnitTypeId
 from sc2.ids.upgrade_id import UpgradeId
 from sc2.unit import Unit
@@ -74,10 +77,34 @@ scaled to ~0.5-50. Keeps it balanced with other scoring layers."""
 DEFAULT_TYPE_VALUE = 5.0
 """Fallback for unit types not in UNIT_DATA (edge cases, new units)."""
 
+# ===== STATE-VARIANT NORMALIZATION =====
+# The game reports a unit's current state as its own id: a burrowed Roach is
+# ROACHBURROWED, a sieged Tank is SIEGETANKSIEGED, an assault-mode Viking is
+# VIKINGASSAULT. python-sc2 generates its alias map from the game's stableid
+# data, so it maps every such variant onto its base id. ARES' UNIT_ALIAS is
+# bidirectional (base -> variant too), which would send a plain lookup the
+# wrong way, hence python-sc2's map is the one used here.
+BASE_UNIT_TYPE: dict[UnitTypeId, UnitTypeId] = dict(UNIT_UNIT_ALIAS)
+"""State-variant id -> base id (ROACHBURROWED -> ROACH).
+
+Copied, not aliased: a caller must never be able to mutate the shared map.
+Prebuilt at import time so the hot path stays a single dict lookup.
+"""
+
+
+def base_unit_type(unit_type: UnitTypeId) -> UnitTypeId:
+    """Map a state-variant id onto its base id (ROACHBURROWED -> ROACH).
+
+    Perf: one dict lookup, no allocation.
+    """
+    return BASE_UNIT_TYPE.get(unit_type, unit_type)
+
+
 TACTICAL_BONUS: dict[UnitTypeId, float] = {
     # Spellcasters: cheap but game-ending abilities
     UnitTypeId.HIGHTEMPLAR:       25.0,  # Storm devastates clumps (army_value only 8.2)
     UnitTypeId.GHOST:             20.0,  # EMP strips shields / snipe (army_value 11.7)
+    UnitTypeId.GHOSTNOVA:         20.0,  # Same unit in nova mode — the bonus follows the unit
     UnitTypeId.INFESTOR:          20.0,  # Fungal / neural parasite (army_value 10.4)
     UnitTypeId.INFESTORBURROWED:  20.0,
     UnitTypeId.VIPER:             18.0,  # Abduct / blinding cloud (army_value 18.7)
@@ -87,10 +114,15 @@ TACTICAL_BONUS: dict[UnitTypeId, float] = {
     UnitTypeId.TEMPEST:           12.0,  # Long-range siege, killing removes pressure (army_value 28.0)
     UnitTypeId.RAVEN:             10.0,  # Detection + abilities (army_value 12.4)
 
-    # Siege / zone denial: positional threat undervalued by cost
+    # Siege / zone denial: positional threat undervalued by cost.
+    # A unit keeps its bonus in every state it can be seen in — the bonus
+    # follows the unit, not the state id the game happens to report.
     UnitTypeId.SIEGETANKSIEGED:   12.0,  # Devastating in position (army_value 17.5)
+    UnitTypeId.SIEGETANK:         12.0,  # Same unit — mobile Tank is the same siege threat
     UnitTypeId.LURKERMPBURROWED:  10.0,  # Active siege threat (army_value 19.0)
+    UnitTypeId.LURKERMP:          10.0,  # Same unit — a Lurker is a Lurker while it moves too
     UnitTypeId.LIBERATORAG:        8.0,  # Zone denial mode (army_value 19.0)
+    UnitTypeId.LIBERATOR:          8.0,  # Same unit — the zone-denial Gun is still a Gun
     UnitTypeId.WIDOWMINEBURROWED: 10.0,  # Hidden splash threat (army_value 4.3)
     UnitTypeId.WIDOWMINE:          8.0,  # Pre-burrow still dangerous
     UnitTypeId.BANELINGBURROWED:   8.0,  # Hidden splash suicide (army_value 2.0)
@@ -102,6 +134,22 @@ TACTICAL_BONUS: dict[UnitTypeId, float] = {
     UnitTypeId.WARPPRISM:         12.0,  # Mobility enabler (army_value 8.9)
     UnitTypeId.WARPPRISMPHASING:  12.0,
 }
+
+
+def tactical_bonus(unit_type: UnitTypeId) -> float:
+    """TACTICAL_BONUS for a unit id, falling back to its base id.
+
+    A state variant must not score differently from the unit it is: the game
+    reporting GHOSTNOVA instead of GHOST says nothing new about how dangerous
+    the Ghost is.
+
+    Perf: one or two dict lookups, no allocation.
+    """
+    bonus = TACTICAL_BONUS.get(unit_type)
+    if bonus is not None:
+        return bonus
+    return TACTICAL_BONUS.get(base_unit_type(unit_type), 0.0)
+
 
 # ===== SCORING TABLE =====
 # (our_type, enemy_type) -> bonus score.
@@ -124,6 +172,11 @@ TACTICAL_BONUS: dict[UnitTypeId, float] = {
 #     - as ENEMY_TYPE (the enemy fields it, we need to know what beats it)
 #   The second side is the PvP mirror side; Observer has no weapon and
 #   Oracle/Mothership are excluded as attackers by design.
+#
+# STATE VARIANTS: the game reports a unit's state as its own id (burrowed
+#   Roach, sieged Tank, assault-mode Viking). A row keyed on the raw id wins;
+#   otherwise the lookup falls back to the base id, so a burrowed Roach scores
+#   like the ROACH row (see resolve_scoring_row).
 #
 # DATA SOURCE: Liquipedia SC2 unit pages (Legacy of the Void versions)
 #   https://liquipedia.net/starcraft2/<UnitName>_(Legacy_of_the_Void)
@@ -153,6 +206,12 @@ SCORING_TABLE: dict[tuple[UnitTypeId, UnitTypeId], float] = {
     (UnitTypeId.STALKER, UnitTypeId.SENTRY):          6.0,  # LP: Guardian Shield makes the Sentry "a high priority target for opposing armies"
     (UnitTypeId.STALKER, UnitTypeId.DISRUPTOR):       6.0,  # LP: "Stalkers can use Blink to avoid damage from the Nova" — the Disruptor has no auto attack
     (UnitTypeId.STALKER, UnitTypeId.LURKERMPBURROWED): -6.0,  # LP: "Lurkers rip the standard complementary gateway unit to Colossi, the Stalker"
+    (UnitTypeId.STALKER, UnitTypeId.LURKERMP):      -6.0,  # Same lurker, out of the burrow — the matchup does not change
+    (UnitTypeId.STALKER, UnitTypeId.REAPER):         6.0,  # LP: Stalker "Strong against: Reaper · Void Ray · Mutalisk"
+    (UnitTypeId.STALKER, UnitTypeId.WIDOWMINE):      6.0,  # LP: Widow Mine "Weak against: Marauder · Ravager · Stalker"
+    (UnitTypeId.STALKER, UnitTypeId.WIDOWMINEBURROWED): 6.0,  # Same mine, waiting underground
+    (UnitTypeId.STALKER, UnitTypeId.CYCLONE):       -6.0,  # LP: Cyclone "Lock On gives it 15 effective range" — out-ranges our 9
+    (UnitTypeId.STALKER, UnitTypeId.SWARMHOSTMP):   -6.0,  # LP: Swarm Host "Strong against: marine · Stalker · Roach"
 
     # Immortals: anti-armor specialist (LP: "50 base damage against armored")
     (UnitTypeId.IMMORTAL, UnitTypeId.ROACH):         10.0,  # LP: "strongly cost-effective against Roaches"
@@ -164,6 +223,7 @@ SCORING_TABLE: dict[tuple[UnitTypeId, UnitTypeId], float] = {
     (UnitTypeId.IMMORTAL, UnitTypeId.ULTRALISK):     12.0,  # LP: "shut down Ultralisk transitions"
     (UnitTypeId.IMMORTAL, UnitTypeId.THOR):          10.0,  # LP: "effective against Thors"
     (UnitTypeId.IMMORTAL, UnitTypeId.LURKERMPBURROWED): 10.0,  # LP: "especially key targets like burrowed Lurkers"
+    (UnitTypeId.IMMORTAL, UnitTypeId.LURKERMP):      10.0,  # Same lurker — the Immortal's bonus damage works on it either way
     # PvP mirror targets (enemy Protoss units we can face)
     (UnitTypeId.IMMORTAL, UnitTypeId.DARKTEMPLAR):    8.0,  # LP: "fragile when detected" — 45-dmg melee can't scratch 550 eHP
     (UnitTypeId.IMMORTAL, UnitTypeId.DISRUPTOR):      8.0,  # LP: "Immortals are sometimes used to handle Disruptors numbers"
@@ -176,6 +236,9 @@ SCORING_TABLE: dict[tuple[UnitTypeId, UnitTypeId], float] = {
     (UnitTypeId.ZEALOT, UnitTypeId.ZERGLING):         6.0,  # LP: "very effective...with even surface areas"
     (UnitTypeId.ZEALOT, UnitTypeId.SIEGETANKSIEGED):  8.0,  # LP: "effective threat against Siege Tanks...absorb 4 shots...friendly-fire"
     (UnitTypeId.ZEALOT, UnitTypeId.MARAUDER):         6.0,  # LP: "competitive against...particularly the Marauder"
+    (UnitTypeId.ZEALOT, UnitTypeId.QUEEN):            6.0,  # LP: Queen "Weak against: Zealot · Marine · Zergling"
+    (UnitTypeId.ZEALOT, UnitTypeId.HELLION):         -6.0,  # LP: Hellion "Strong against: Marine · Zealot · Zergling"
+    (UnitTypeId.ZEALOT, UnitTypeId.HELLIONTANK):     -6.0,  # Same Hellion in tank mode — the cannon is worse for a Zealot
     # PvP mirror targets (enemy Protoss units we can face)
     (UnitTypeId.ZEALOT, UnitTypeId.DARKTEMPLAR):   -8.0,  # LP: DTs "can repel small numbers of Zealots even if they are visible"
     (UnitTypeId.ZEALOT, UnitTypeId.DISRUPTOR):     -8.0,  # LP: Nova "can kill the following units with one shot:... Zealots"
@@ -200,6 +263,8 @@ SCORING_TABLE: dict[tuple[UnitTypeId, UnitTypeId], float] = {
     (UnitTypeId.ARCHON, UnitTypeId.SIEGETANKSIEGED):  8.0,  # LP: "the Archon is now the most durable unit against Siege Tank fire"
     (UnitTypeId.ARCHON, UnitTypeId.SIEGETANK):        6.0,  # Same durability, weaker mobile gun
     (UnitTypeId.ARCHON, UnitTypeId.ROACH):            8.0,  # LP: "their bonus against biological units makes Archons effective against all Zerg units"
+    (UnitTypeId.ARCHON, UnitTypeId.QUEEN):           8.0,  # Same bonus against biological units
+    (UnitTypeId.ARCHON, UnitTypeId.SWARMHOSTMP):     6.0,  # LP: Swarm Host "Weak against: Baneling · Hellion · Archon"
 
     # Colossus: splash vs light units (LP: "bonus damage against light")
     (UnitTypeId.COLOSSUS, UnitTypeId.MARINE):        10.0,  # LP: "good against Marine-heavy...bonus against Light"
@@ -208,6 +273,8 @@ SCORING_TABLE: dict[tuple[UnitTypeId, UnitTypeId], float] = {
     (UnitTypeId.COLOSSUS, UnitTypeId.ZEALOT):         6.0,  # LP: "very strong against large numbers of Zealots"
     (UnitTypeId.COLOSSUS, UnitTypeId.ADEPT):          6.0,  # Light unit, splash
     (UnitTypeId.COLOSSUS, UnitTypeId.BANELING):       8.0,  # Light unit, low HP — splash destroys
+    (UnitTypeId.COLOSSUS, UnitTypeId.HELLION):       6.0,  # Light unit, splash
+    (UnitTypeId.COLOSSUS, UnitTypeId.HELLIONTANK):   6.0,  # Same Hellion in tank mode — light, splash
     # NOTE: Colossus vs Roach REMOVED — LP: "not as cost-effective" (no armor bonus)
     # Colossus HARD-COUNTERED by anti-air: negative values reduce production via nudging
     (UnitTypeId.COLOSSUS, UnitTypeId.VIKINGFIGHTER):  -10.0,  # LP: "Vikings...primary counter to Colossi"
@@ -232,6 +299,16 @@ SCORING_TABLE: dict[tuple[UnitTypeId, UnitTypeId], float] = {
     (UnitTypeId.DISRUPTOR, UnitTypeId.HYDRALISK):      6.0,  # Clumped hydras vulnerable
     (UnitTypeId.DISRUPTOR, UnitTypeId.IMMORTAL):       5.0,  # Doesn't one-shot (200HP+100S), but decent
     (UnitTypeId.DISRUPTOR, UnitTypeId.LURKERMPBURROWED): 8.0,  # LP: "Lurkers" can't move
+    (UnitTypeId.DISRUPTOR, UnitTypeId.LURKERMP):     8.0,  # Same lurker — a Nova still hits it once it surfaces
+    (UnitTypeId.DISRUPTOR, UnitTypeId.QUEEN):        6.0,  # LP: two Novas needed
+    (UnitTypeId.DISRUPTOR, UnitTypeId.REAPER):       8.0,  # Nova one-shot
+    (UnitTypeId.DISRUPTOR, UnitTypeId.CYCLONE):      6.0,  # LP: two Novas needed
+    (UnitTypeId.DISRUPTOR, UnitTypeId.WIDOWMINE):    8.0,  # Nova one-shot
+    (UnitTypeId.DISRUPTOR, UnitTypeId.WIDOWMINEBURROWED): 8.0,  # Same mine underground
+    (UnitTypeId.DISRUPTOR, UnitTypeId.HELLION):      8.0,  # Nova one-shot
+    (UnitTypeId.DISRUPTOR, UnitTypeId.HELLIONTANK):  8.0,  # Same Hellion in tank mode
+    (UnitTypeId.DISRUPTOR, UnitTypeId.INFESTOR):     8.0,  # Nova one-shot
+    (UnitTypeId.DISRUPTOR, UnitTypeId.SWARMHOSTMP):  6.0,  # LP: two Novas needed
     # Nova one-shots (LP: "can kill the following units with one shot: ... Zealots, Stalkers, High Templars, Dark Templars, Adepts, Disruptors, and Sentries")
     (UnitTypeId.DISRUPTOR, UnitTypeId.ZEALOT):      10.0,  # Nova one-shot
     (UnitTypeId.DISRUPTOR, UnitTypeId.HIGHTEMPLAR): 10.0,  # Nova one-shot
@@ -251,6 +328,7 @@ SCORING_TABLE: dict[tuple[UnitTypeId, UnitTypeId], float] = {
     (UnitTypeId.HIGHTEMPLAR, UnitTypeId.ROACH):        6.0,  # Clumped Roaches take storm damage
     (UnitTypeId.HIGHTEMPLAR, UnitTypeId.MUTALISK):     4.0,  # LP: "Mutas escape storms fairly easily...Archons fare better"
     (UnitTypeId.HIGHTEMPLAR, UnitTypeId.GHOST):       10.0,  # LP: "Feedback...counteracted by using Feedback on Ghost"
+    (UnitTypeId.HIGHTEMPLAR, UnitTypeId.INFESTOR):   10.0,  # LP: Feedback "used to snipe enemy spell casters like Ghosts and Infestors"
     (UnitTypeId.HIGHTEMPLAR, UnitTypeId.VIPER):       10.0,  # LP: "Feedback is only really useful versus Vipers"
     # Feedback targets (LP: "Dealing pure damage, ignores all types of armor"; the Sentry/Phoenix/Oracle are all susceptible)
     (UnitTypeId.HIGHTEMPLAR, UnitTypeId.PHOENIX):    8.0,  # LP: "High Templars can also be used to Feedback Phoenixes and Oracles"
@@ -344,6 +422,35 @@ SITUATIONAL_ROWS: set[tuple[UnitTypeId, UnitTypeId]] = {
 }
 
 
+def resolve_scoring_row(
+    our_type: UnitTypeId,
+    enemy_type: UnitTypeId,
+) -> tuple[tuple[UnitTypeId, UnitTypeId], float]:
+    """Find the SCORING_TABLE row for a unit pair, tolerating state variants.
+
+    The raw ids win so state-specific rows keep their meaning (a sieged Tank
+    is scored differently from a mobile one). The base-id fallback fills the
+    holes: a burrowed Roach lands on the ROACH row, an assault-mode Viking on
+    the VIKINGFIGHTER row.
+
+    Returns the matched (key, value). The value is 0.0 when no row matches.
+
+    Perf: up to four dict lookups, no allocation.
+    """
+    base_our = base_unit_type(our_type)
+    base_enemy = base_unit_type(enemy_type)
+    for key in (
+        (our_type, enemy_type),
+        (our_type, base_enemy),
+        (base_our, enemy_type),
+        (base_our, base_enemy),
+    ):
+        value = SCORING_TABLE.get(key)
+        if value is not None:
+            return key, value
+    return (our_type, enemy_type), 0.0
+
+
 def update_upgrades(upgrades: set) -> None:
     """Cache the bot's researched upgrades for use in score_target.
 
@@ -375,8 +482,10 @@ def score_target(my_unit: Unit, enemy: Unit) -> float:
 
     # Layer 3: Unit type value (army_value base + tactical bonus)
     data = UNIT_DATA.get(enemy.type_id)
+    if data is None:
+        data = UNIT_DATA.get(base_unit_type(enemy.type_id))
     base_value = (data["army_value"] * TYPE_VALUE_SCALE) if data else DEFAULT_TYPE_VALUE
-    score += base_value + TACTICAL_BONUS.get(enemy.type_id, 0.0)
+    score += base_value + tactical_bonus(enemy.type_id)
 
     # Repairer: confirmed SCV/MULE repairing a Bunker/PF — kill the heal
     # instead of out-damaging it (see intel.update_repair_detection)
@@ -391,9 +500,9 @@ def score_target(my_unit: Unit, enemy: Unit) -> float:
     # Scoring table bonus (Zealots only get counter bonuses with Charge upgrade)
     if my_unit.type_id == UnitTypeId.ZEALOT:
         if UpgradeId.CHARGE in _cached_upgrades:
-            score += SCORING_TABLE.get((my_unit.type_id, enemy.type_id), 0.0)
+            score += resolve_scoring_row(my_unit.type_id, enemy.type_id)[1]
     else:
-        score += SCORING_TABLE.get((my_unit.type_id, enemy.type_id), 0.0)
+        score += resolve_scoring_row(my_unit.type_id, enemy.type_id)[1]
 
     # --- Per-Unit Score (specific to this unit) ---
 
