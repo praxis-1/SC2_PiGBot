@@ -309,13 +309,16 @@ GATEKEEPER_ZEALOT_RADIUS = 1.0
 GATEKEEPER_CLEARANCE_MARGIN = 0.3
 """Preferred gap kept around structure footprints when parking, so the engine never shoves the zealot"""
 
-GATEKEEPER_PARK_DISTANCES = (2.5, GATEKEEPER_MOVE_DISTANCE, 3.5, 4.0, 4.5, 5.0)
+GATEKEEPER_PARK_DISTANCES = (2.5, GATEKEEPER_MOVE_DISTANCE)
 """Distances behind the gate a parking spot may sit at, closest first"""
 
 GATEKEEPER_PARK_MIN_DISTANCE = GATEKEEPER_PARK_DISTANCES[0]
 """Closest a parking spot may sit to the gate - clears a 2x2 building placed on the gap"""
 
-GATEKEEPER_PARK_LATERAL_OFFSETS = (0.0, -1.5, 1.5, -2.5, 2.5)
+GATEKEEPER_PARK_MAX_DISTANCE = GATEKEEPER_DETECTION_RANGE / 2
+"""Furthest the gatekeeper may park from the gap - half the detection range, so it is back in time"""
+
+GATEKEEPER_PARK_LATERAL_OFFSETS = (0.0, -1.0, 1.0, -1.5, 1.5)
 """Lateral (parallel to the wall) offsets tried next to the gate - straight behind first"""
 
 GATEKEEPER_CLEARANCE_SEARCH_RADIUS = 9.0

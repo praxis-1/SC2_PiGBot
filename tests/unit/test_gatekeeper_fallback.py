@@ -27,7 +27,9 @@ from bot.combat.combat import (
 )
 from bot.constants import (
     GATEKEEPER_CLEARANCE_MARGIN,
+    GATEKEEPER_DETECTION_RANGE,
     GATEKEEPER_ORDER_TOLERANCE,
+    GATEKEEPER_PARK_MAX_DISTANCE,
     GATEKEEPER_PARK_MIN_DISTANCE,
     GATEKEEPER_ZEALOT_RADIUS,
 )
@@ -69,6 +71,7 @@ class FakeGatekeeper:
     def move(self, target):
         self.moves.append(target)
         self.order_target = target
+        self.orders = [SimpleNamespace(ability=SimpleNamespace(id=AbilityId.MOVE))]
 
     def __call__(self, ability, **kwargs):
         self.orders = [SimpleNamespace(ability=SimpleNamespace(id=ability))]
@@ -111,18 +114,44 @@ def test_clearance_accounts_for_the_whole_footprint():
 
 
 def test_parking_spot_keeps_clear_of_the_building_the_probe_uses():
-    """The pylon case: a building three tiles behind the gate is where the old
-    fixed-offset fallback landed, so the parking spot has to move somewhere else."""
+    """The pylon case: a building four tiles behind the gate is where the old
+    fixed-offset fallback used to land, so the parking spot has to move."""
     gate_pos = Point2((10, 10))
-    structures = [FakeStructure(10, 13, footprint_radius=1.5)]
+    structures = [FakeStructure(10, 15, footprint_radius=1.5)]
     bot = _bot(structures=structures)
 
     spot = _find_parking_spot(bot, gate_pos, _gatekeeper_structures(bot, gate_pos))
 
     assert spot is not None
     assert _clearance_to_structures(spot, structures) >= GATEKEEPER_CLEARANCE_MARGIN
-    assert cy_distance_to(spot, Point2((10, 13))) >= 1.5 + GATEKEEPER_ZEALOT_RADIUS
+    assert cy_distance_to(spot, Point2((10, 15))) >= 1.5 + GATEKEEPER_ZEALOT_RADIUS
     assert cy_distance_to(spot, gate_pos) >= GATEKEEPER_PARK_MIN_DISTANCE
+
+
+def test_parking_spot_stays_inside_the_reaction_budget():
+    """Parked too far back, the zealot is still walking towards the gap when a
+    detected enemy arrives - half the detection range is the budget."""
+    gate_pos = Point2((10, 10))
+    bot = _bot()
+
+    spot = _find_parking_spot(bot, gate_pos, _gatekeeper_structures(bot, gate_pos))
+
+    assert spot is not None
+    assert cy_distance_to(spot, gate_pos) <= GATEKEEPER_PARK_MAX_DISTANCE
+    assert GATEKEEPER_PARK_MAX_DISTANCE == GATEKEEPER_DETECTION_RANGE / 2
+
+
+def test_no_parking_spot_outside_the_reaction_budget():
+    """A room further back than the budget is no room at all - the gatekeeper
+    would not make it back in time."""
+    gate_pos = Point2((10, 10))
+    structures = [
+        FakeStructure(10, 13, footprint_radius=1.5),
+        FakeStructure(10, 16, footprint_radius=2.5),
+    ]
+    bot = _bot(structures=structures)
+
+    assert _find_parking_spot(bot, gate_pos, _gatekeeper_structures(bot, gate_pos)) is None
 
 
 def test_no_parking_spot_when_structures_cover_every_candidate():
@@ -158,7 +187,7 @@ def test_move_order_is_not_reissued_for_the_same_target():
 
 
 def test_gatekeeper_parks_clear_of_the_building_instead_of_standing_on_it():
-    structures = [FakeStructure(10, 13, footprint_radius=1.5)]
+    structures = [FakeStructure(10, 15, footprint_radius=1.5)]
     bot = _bot(structures=structures)
     gate = FakeGatekeeper((10, 12.5))
 
@@ -167,11 +196,11 @@ def test_gatekeeper_parks_clear_of_the_building_instead_of_standing_on_it():
     assert len(gate.moves) == 1
     parked = gate.moves[0]
     assert _clearance_to_structures(parked, structures) >= GATEKEEPER_CLEARANCE_MARGIN
-    assert cy_distance_to(parked, Point2((10, 13))) >= 1.5 + GATEKEEPER_ZEALOT_RADIUS
+    assert cy_distance_to(parked, Point2((10, 15))) >= 1.5 + GATEKEEPER_ZEALOT_RADIUS
 
 
 def test_parked_gatekeeper_is_not_re_ordered_every_frame():
-    bot = _bot(structures=[FakeStructure(10, 13, footprint_radius=1.5)])
+    bot = _bot(structures=[FakeStructure(10, 15, footprint_radius=1.5)])
     gate = FakeGatekeeper((10, 12.5))
 
     gatekeeper_control(bot, [gate])
@@ -180,7 +209,23 @@ def test_parked_gatekeeper_is_not_re_ordered_every_frame():
     assert len(gate.moves) == 1
 
 
-def test_building_landing_on_the_parking_spot_reparks_the_gatekeeper():
+def test_gatekeeper_holds_when_nothing_fits_behind_the_gate():
+    """No room inside the reaction budget: hold where we are rather than walk
+    back into the building the probe is placing."""
+    structures = [
+        FakeStructure(10, 13, footprint_radius=1.5),
+        FakeStructure(10, 16, footprint_radius=2.5),
+    ]
+    bot = _bot(structures=structures)
+    gate = FakeGatekeeper((10, 12.5))
+
+    gatekeeper_control(bot, [gate])
+
+    assert gate.moves == []
+    assert gate.holds == 1
+
+
+def test_building_landing_on_the_parking_spot_drops_the_stale_move_order():
     bot = _bot()
     gate = FakeGatekeeper((10, 10))
 
@@ -191,8 +236,9 @@ def test_building_landing_on_the_parking_spot_reparks_the_gatekeeper():
     bot.structures = FakeUnits([FakeStructure(parked.x, parked.y, footprint_radius=1.5)])
     gatekeeper_control(bot, [gate])
 
-    assert len(gate.moves) == 2
-    assert gate.moves[1] != parked
+    # the zealot must not keep walking towards the tile the building now covers
+    assert gate.moves == [parked]
+    assert gate.orders[0].ability.id == AbilityId.HOLDPOSITION
 
 
 def test_gate_is_held_when_enemies_are_close():

@@ -40,6 +40,7 @@ from bot.constants import (
     GATEKEEPER_CLEARANCE_MARGIN,
     GATEKEEPER_PARK_DISTANCES,
     GATEKEEPER_PARK_MIN_DISTANCE,
+    GATEKEEPER_PARK_MAX_DISTANCE,
     GATEKEEPER_PARK_LATERAL_OFFSETS,
     GATEKEEPER_CLEARANCE_SEARCH_RADIUS,
     GATEKEEPER_POSITION_TOLERANCE,
@@ -1394,13 +1395,19 @@ def _is_walkable(bot, position: Point2) -> bool:
 def _parking_spot_is_free(bot, position: Point2, gate_pos: Point2, structures: list[Unit]) -> bool:
     """A spot is free when the zealot fits, the tile is walkable and the gap stays clear.
 
-    The gap itself never qualifies: a probe may be about to build there.
+    The gap itself never qualifies: a probe may be about to build there. The spot also
+    has to stay inside the reaction budget - parked too far back, the zealot is still
+    walking towards the gap when a detected enemy arrives - and keep the same comfort
+    margin the spot was picked with, so a tight tile gets traded for a roomier one.
     """
-    if cy_distance_to(position, gate_pos) < GATEKEEPER_PARK_MIN_DISTANCE:
+    distance_to_gate = cy_distance_to(position, gate_pos)
+    if distance_to_gate < GATEKEEPER_PARK_MIN_DISTANCE:
+        return False
+    if distance_to_gate > GATEKEEPER_PARK_MAX_DISTANCE:
         return False
     if not _is_walkable(bot, position):
         return False
-    return _clearance_to_structures(position, structures) >= 0.0
+    return _clearance_to_structures(position, structures) >= GATEKEEPER_CLEARANCE_MARGIN
 
 
 def _find_parking_spot(bot, gate_pos: Point2, structures: list[Unit]) -> Point2 | None:
@@ -1422,6 +1429,10 @@ def _find_parking_spot(bot, gate_pos: Point2, structures: list[Unit]) -> Point2 
     for distance in GATEKEEPER_PARK_DISTANCES:
         for offset in GATEKEEPER_PARK_LATERAL_OFFSETS:
             candidate = gate_pos + inward * distance + lateral * offset
+            # Stay inside the reaction budget: the gatekeeper has to be back on the
+            # gap before a detected enemy reaches it.
+            if cy_distance_to(candidate, gate_pos) > GATEKEEPER_PARK_MAX_DISTANCE:
+                continue
             if not _is_walkable(bot, candidate):
                 continue
             gap = _clearance_to_structures(candidate, structures)
@@ -1487,8 +1498,11 @@ def _park_off_the_gate(bot, gate: Unit, gate_pos: Point2, structures: list[Unit]
     )
 
     if spot is None:
-        # Nothing fits next to the gate: stay where the engine put us rather than
-        # ordering into a tile that overlaps a building.
+        # Nothing fits next to the gate: hold where we are so the engine's push-out
+        # settles the zealot. Leaving the old move order live walks it straight back
+        # into the building - the tug-of-war this fallback exists to avoid.
+        if not _is_holding_position(gate):
+            gate(AbilityId.HOLDPOSITION)
         return
     _order_move(gate, spot)
 
